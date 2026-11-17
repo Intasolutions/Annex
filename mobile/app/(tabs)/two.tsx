@@ -1,0 +1,1505 @@
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import {
+  StyleSheet, FlatList, TextInput, ActivityIndicator,
+  TouchableOpacity, Alert, Text, View, useColorScheme, StatusBar, Modal, ScrollView
+} from 'react-native';
+import { FontAwesome5 } from '@expo/vector-icons';
+import { router, useLocalSearchParams, useFocusEffect } from 'expo-router';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import DateTimePicker from '@react-native-community/datetimepicker';
+import { getStudents } from '../../src/api/sales';
+import { Audio } from 'expo-av';
+import client from '../../src/api/client';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+export default function SalesScreen() {
+  const params = useLocalSearchParams<{ mode?: string }>();
+  const colorScheme = useColorScheme();
+  const isDark = colorScheme === 'dark';
+  const insets = useSafeAreaInsets();
+
+  // ── Auth & user ──────────────────────────────────────────────────────────
+  const [user, setUser] = useState<any>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
+  // ── Stats ─────────────────────────────────────────────────────────────────
+  const [stats, setStats] = useState<any>(null);
+
+  // ── Pipeline stages ───────────────────────────────────────────────────────
+  const [pipelineStages, setPipelineStages] = useState<any[]>([
+    { id: 'NEW', name: 'New' },
+    { id: 'FOLLOW_UP', name: 'Follow Up' },
+    { id: 'PAYMENT_PENDING', name: 'Payment Pending' },
+    { id: 'ENROLLED', name: 'Enrolled' },
+    { id: 'DROPPED', name: 'Dropped' },
+  ]);
+
+  // ── Leads list ────────────────────────────────────────────────────────────
+  const [leads, setLeads] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [totalLeads, setTotalLeads] = useState(0);
+  const [currentPage, setCurrentPage] = useState(1);
+  const PAGE_SIZE = 50;
+
+  // ── Filters & search ──────────────────────────────────────────────────────
+  const [search, setSearch] = useState('');
+  const [sortOrder, setSortOrder] = useState<'-id' | 'id'>('-id');
+  const [selectedFilter, setSelectedFilter] = useState<any>({ label: 'All', type: 'all', value: 'All' });
+  const [showFilters, setShowFilters] = useState(false);
+  const [startDate, setStartDate] = useState<Date | null>(null);
+  const [endDate, setEndDate] = useState<Date | null>(null);
+  const [showPicker, setShowPicker] = useState<'start' | 'end' | null>(null);
+  const [viewMode, setViewMode] = useState<'NEW' | 'PIPELINE' | 'CALLS' | 'TASKS'>('NEW');
+
+  // ── BDE Executive Filter States (Admin / Team Lead / Super Admin) ─────────
+  const [bdeExecutives, setBdeExecutives] = useState<any[]>([]);
+  const [selectedBde, setSelectedBde] = useState<string>('');
+  const [showBdeModal, setShowBdeModal] = useState(false);
+  const [bdeSearch, setBdeSearch] = useState('');
+  const [mappedFolderUri, setMappedFolderUri] = useState<string | null>(null);
+  const [mappedFolderInfo, setMappedFolderInfo] = useState<{ folderName: string; audioRecordingsCount: number } | null>(null);
+
+  // ── Lead Tasks States ─────────────────────────────────────────────────────
+  const [leadTasks, setLeadTasks] = useState<any[]>([]);
+  const [loadingLeadTasks, setLoadingLeadTasks] = useState(false);
+
+  const fetchLeadTasks = async () => {
+    try {
+      setLoadingLeadTasks(true);
+      const taskParams: any = {};
+      if (selectedBde) taskParams.assigned_to = selectedBde;
+      const res = await client.get('/crm/lead-tasks/', { params: taskParams });
+      const data = res.data?.results || res.data || [];
+      setLeadTasks(data);
+    } catch (e) {
+      console.error('Failed to fetch BDE lead tasks:', e);
+    } finally {
+      setLoadingLeadTasks(false);
+    }
+  };
+
+  useEffect(() => {
+    if (params.mode === 'TASKS') {
+      setViewMode('TASKS');
+    }
+  }, [params.mode]);
+
+  // ── Recent Calls States ──
+  const [recentCalls, setRecentCalls] = useState<any[]>([]);
+  const [loadingCalls, setLoadingCalls] = useState(false);
+  const [loadingMoreCalls, setLoadingMoreCalls] = useState(false);
+  const [hasMoreCalls, setHasMoreCalls] = useState(false);
+  const [callsPage, setCallsPage] = useState(1);
+  const [playingAudio, setPlayingAudio] = useState<string | null>(null);
+  const [sound, setSound] = useState<Audio.Sound | null>(null);
+
+  const loadMappedFolder = async () => {
+    try {
+      const { getMappedRecordingFolder, scanRecordingFolder } = await import('../../src/utils/CallManager');
+      const uri = await getMappedRecordingFolder();
+      if (uri) {
+        const info = await scanRecordingFolder(uri);
+        if (info && info.accessible) {
+          setMappedFolderUri(uri);
+          setMappedFolderInfo({
+            folderName: info.folderName,
+            audioRecordingsCount: info.audioRecordingsCount,
+          });
+          const { syncMissingRecordings } = await import('../../src/utils/SyncManager');
+          syncMissingRecordings().catch(() => {});
+        } else {
+          setMappedFolderUri(null);
+          setMappedFolderInfo(null);
+        }
+      }
+    } catch (_) {}
+  };
+
+  const openFolderPickerAndMap = async () => {
+    const { pickAndMapRecordingFolder } = await import('../../src/utils/CallManager');
+    const result = await pickAndMapRecordingFolder();
+    if (result.status === 'selected' && result.uri) {
+      const folderName = result.folderInfo?.folderName || 'Selected Folder';
+      const recCount = result.folderInfo?.audioRecordingsCount ?? 0;
+      setMappedFolderUri(result.uri);
+      setMappedFolderInfo({
+        folderName,
+        audioRecordingsCount: recCount,
+      });
+      const { syncMissingRecordings } = await import('../../src/utils/SyncManager');
+      syncMissingRecordings().catch(() => {});
+      Alert.alert(
+        'Folder Mapped',
+        `Folder: ${folderName}\nAvailable Recordings: ${recCount} audio file(s)\n\nCall recordings will now be scanned from this folder!`
+      );
+    } else if (result.status === 'denied') {
+      Alert.alert(
+        'Permission Required',
+        result.errorMessage || 'Please grant directory access permission to scan call recordings.'
+      );
+    } else if (result.status === 'unsupported') {
+      Alert.alert('Not Supported', result.errorMessage || 'Folder mapping is only supported on Android devices.');
+    } else if (result.status === 'error') {
+      Alert.alert('Folder Mapping Error', result.errorMessage || 'Unable to open the system folder picker.');
+    }
+  };
+
+  const handleMapFolderPress = async () => {
+    if (!mappedFolderUri) {
+      await openFolderPickerAndMap();
+      return;
+    }
+
+    const { scanRecordingFolder } = await import('../../src/utils/CallManager');
+    const info = await scanRecordingFolder(mappedFolderUri);
+    if (!info || !info.accessible) {
+      setMappedFolderUri(null);
+      setMappedFolderInfo(null);
+      await openFolderPickerAndMap();
+      return;
+    }
+
+    setMappedFolderInfo({
+      folderName: info.folderName,
+      audioRecordingsCount: info.audioRecordingsCount,
+    });
+
+    Alert.alert(
+      'Mapped Recording Folder',
+      `Folder: ${info.folderName}\nAvailable Recordings: ${info.audioRecordingsCount} audio file(s)\n\nCall recordings in this folder are automatically scanned and linked to leads.`,
+      [
+        {
+          text: 'Rescan Folder',
+          onPress: async () => {
+            const refreshed = await scanRecordingFolder(mappedFolderUri);
+            if (refreshed && refreshed.accessible) {
+              setMappedFolderInfo({
+                folderName: refreshed.folderName,
+                audioRecordingsCount: refreshed.audioRecordingsCount,
+              });
+              const { syncMissingRecordings } = await import('../../src/utils/SyncManager');
+              await syncMissingRecordings().catch(() => {});
+              Alert.alert(
+                'Scan Complete',
+                `Scanned ${refreshed.folderName}\nFound ${refreshed.audioRecordingsCount} audio recording(s).`
+              );
+            }
+          },
+        },
+        {
+          text: 'Change Folder',
+          onPress: () => {
+            openFolderPickerAndMap();
+          },
+        },
+        { text: 'Close', style: 'cancel' },
+      ]
+    );
+  };
+
+  // ── Init ──────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    loadUser();
+    fetchPipelineStages();
+    loadMappedFolder();
+  }, []);
+
+  const canFilterByBde = ['SUPER_ADMIN', 'ADMIN', 'TEAM_LEAD', 'SALES_HEAD', 'SALES_MANAGER', 'MANAGER', 'SALES_LEAD'].includes(user?.role) || Boolean(user?.is_manager);
+
+  useEffect(() => {
+    if (!authLoading && canFilterByBde) {
+      fetchBdeExecutives();
+    }
+  }, [authLoading, canFilterByBde]);
+
+  const fetchBdeExecutives = async () => {
+    try {
+      const res = await client.get('/crm/sales-users/');
+      const list = Array.isArray(res.data) ? res.data : (res.data?.results || []);
+      setBdeExecutives(list);
+    } catch (e) {
+      console.log('Failed to fetch BDE executives:', e);
+    }
+  };
+
+  const hasInitialFetchedRef = useRef(false);
+
+  useEffect(() => {
+    if (authLoading) return;
+    fetchStats();
+    if (viewMode === 'TASKS') {
+      fetchLeadTasks();
+      return;
+    }
+    if (viewMode === 'CALLS') {
+      fetchRecentCalls(1, true);
+      return;
+    }
+    const t = setTimeout(() => {
+      setLeads([]);
+      setCurrentPage(1);
+      fetchLeads(1, true);
+    }, 300);
+    return () => clearTimeout(t);
+  }, [search, selectedFilter, selectedBde, sortOrder, startDate, endDate, viewMode, authLoading, user?.role]);
+
+  useFocusEffect(
+    useCallback(() => {
+      if (authLoading) return;
+      if (!hasInitialFetchedRef.current) {
+        hasInitialFetchedRef.current = true;
+        return;
+      }
+      fetchStats();
+      if (viewMode === 'TASKS') {
+        fetchLeadTasks();
+      } else if (viewMode === 'CALLS') {
+        fetchRecentCalls(1, false);
+      } else {
+        fetchLeads(1, false);
+      }
+    }, [authLoading, viewMode, selectedBde, selectedFilter, search, sortOrder, startDate, endDate])
+  );
+
+  const loadUser = async () => {
+    try {
+      const cached = await AsyncStorage.getItem('userInfo');
+      if (cached) {
+        try {
+          const parsed = JSON.parse(cached);
+          if (parsed && (parsed.role || parsed.username)) {
+            setUser(parsed);
+          }
+        } catch (parseErr) {
+          console.warn('[SalesScreen] Failed to parse cached userInfo:', parseErr);
+        }
+      }
+      const token = await AsyncStorage.getItem('userToken');
+      if (token) {
+        const res = await client.get('/auth/me/');
+        if (res.data && res.data.role && (res.data.username || res.data.id)) {
+          setUser(res.data);
+          await AsyncStorage.setItem('userInfo', JSON.stringify(res.data));
+        }
+      }
+    } catch (e) {
+      console.log('[SalesScreen] Failed to refresh user details from API, keeping cached state:', e);
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const fetchStats = async () => {
+    try {
+      const params: any = {};
+      if (selectedBde) params.assigned_to = selectedBde;
+      if (startDate) params.start_date = startDate.toISOString().split('T')[0];
+      if (endDate) params.end_date = endDate.toISOString().split('T')[0];
+      const res = await client.get('/crm/dashboard-stats/', { params });
+      if (res.data) setStats(res.data);
+    } catch (e) {}
+  };
+
+  const fetchPipelineStages = async () => {
+    try {
+      const res = await client.get('/crm/stages/');
+      const data = res.data?.results || res.data || [];
+      if (data.length > 0) setPipelineStages(data);
+    } catch (e) {}
+  };
+
+  const fetchLeads = async (page = 1, reset = false) => {
+    if (reset) setLoading(true);
+    else setLoadingMore(true);
+
+    const params: any = { page, page_size: PAGE_SIZE, ordering: sortOrder };
+    if (search) params.search = search;
+    if (selectedBde) params.assigned_to = selectedBde;
+    if (selectedFilter.type === 'lead_status') params.lead_status = selectedFilter.value;
+    else if (selectedFilter.type === 'upcoming_followups') params.upcoming_followups = 'true';
+    if (startDate) params.start_date = startDate.toISOString().split('T')[0];
+    if (endDate) params.end_date = endDate.toISOString().split('T')[0];
+    if (viewMode === 'NEW') {
+      params.new_only = 'true';
+    } else {
+      params.pipeline_only = 'true';
+    }
+
+    // Sales screen should NEVER show converted/enrolled leads, regardless of user role.
+    // They belong to the Mentors view now.
+    params.hide_converted = 'true';
+
+    const data = await getStudents(params);
+    let list = data.results || [];
+    
+    // ── FRONTEND HARD-FILTER: Absolutely force hide converted leads for EVERYONE on this screen ──
+    list = list.filter((item: any) => {
+      const raw = item.lead_status || item.status || 'NEW';
+      const name = resolveStage(raw).toUpperCase();
+      const id = String(raw).toUpperCase();
+      return !name.includes('ENROL') && !name.includes('CONVERT') && id !== 'ENROLLED' && id !== 'CONVERTED';
+    });
+
+    const count = data.count || list.length;
+
+    setLeads(prev => (reset || page === 1) ? list : [...prev, ...list]);
+    setTotalLeads(count);
+    setCurrentPage(page);
+    setLoading(false);
+    setLoadingMore(false);
+  };
+
+  const handleRefresh = async () => {
+    setRefreshing(true);
+    await fetchLeads(1, true);
+    await fetchStats();
+    setRefreshing(false);
+  };
+
+  const handleLoadMore = () => {
+    if (viewMode === 'CALLS') {
+      if (!loadingMoreCalls && hasMoreCalls) fetchRecentCalls(callsPage + 1);
+    } else {
+      if (!loadingMore && leads.length < totalLeads) fetchLeads(currentPage + 1);
+    }
+  };
+
+  const fetchRecentCalls = async (page = 1, reset = false) => {
+    if (page === 1) {
+      setLoadingCalls(true);
+      if (reset) setRecentCalls([]);
+    } else {
+      setLoadingMoreCalls(true);
+    }
+    try {
+      const params: any = { interaction_type: 'CALL', page };
+      if (search) params.search = search;
+      if (selectedBde) params.assigned_to = selectedBde;
+      if (startDate) params.start_date = startDate.toISOString().split('T')[0];
+      if (endDate) params.end_date = endDate.toISOString().split('T')[0];
+      
+      const res = await client.get('/crm/interactions/', { params });
+      const raw = res.data;
+      const data = raw?.results || (Array.isArray(raw) ? raw : []);
+      const filtered = data.filter((item: any) => item.interaction_type === 'CALL');
+      
+      if (page === 1 || reset) {
+        setRecentCalls(filtered);
+      } else {
+        setRecentCalls(prev => [...prev, ...filtered]);
+      }
+      setHasMoreCalls(!!(raw?.next));
+      setCallsPage(page);
+    } catch (err) {
+      console.log('Failed to fetch recent calls:', err);
+    } finally {
+      setLoadingCalls(false);
+      setLoadingMoreCalls(false);
+    }
+  };
+  const playAudio = async (url: string, id: string) => {
+    if (playingAudio === id) {
+       if (sound) {
+          await sound.stopAsync();
+          setPlayingAudio(null);
+       }
+       return;
+    }
+    
+    try {
+      if (sound) {
+         await sound.unloadAsync();
+      }
+      const { sound: newSound } = await Audio.Sound.createAsync({ uri: url });
+      setSound(newSound);
+      setPlayingAudio(id);
+      
+      newSound.setOnPlaybackStatusUpdate((status) => {
+         if (status.isLoaded && status.didJustFinish) {
+            setPlayingAudio(null);
+         }
+      });
+      
+      await newSound.playAsync();
+    } catch (e) {
+      console.log('Audio playback error', e);
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      if (sound) {
+        sound.unloadAsync();
+      }
+    };
+  }, [sound]);
+
+  const renderRecentCall = ({ item }: { item: any }) => {
+    const notesStr = item.notes || '';
+    let duration = '';
+    let cleanNote = notesStr;
+    
+    const durMatch = notesStr.match(/Duration:\s*([^\n]+)/i);
+    if (durMatch) {
+      duration = durMatch[1].replace(/notes:.*$/gi, '').trim();
+    }
+    
+    const notesIndex = notesStr.toLowerCase().indexOf('notes:');
+    if (notesIndex !== -1) {
+      cleanNote = notesStr.substring(notesIndex + 6).trim();
+    } else {
+      cleanNote = notesStr.replace(/^(Incoming\s+)?Call\s*-\s*Duration:\s*[^\n]+\n?/i, '').trim();
+    }
+
+    const formattedTime = new Date(item.date).toLocaleString([], {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+
+    const displayName = item.student_name || `Student ID: ${item.student}`;
+    const displayPhone = item.student_phone || 'No Phone';
+
+    return (
+      <TouchableOpacity 
+        style={[styles.historyCard, isDark && styles.darkCard]}
+        onPress={() => {
+          if (item.student) {
+            router.push({
+              pathname: '/lead-details',
+              params: {
+                leadId: String(item.student),
+                initialName: item.student_name || '',
+                initialMobile: item.student_phone || item.customer_number || ''
+              }
+            } as any);
+          }
+        }}
+      >
+        <View style={styles.historyLeft}>
+          <View style={styles.historyIcon}>
+            <FontAwesome5 name="phone" size={14} color="#10B981" />
+          </View>
+          <View style={{ flex: 1, marginLeft: 12 }}>
+            <Text style={[styles.historyName, isDark && styles.darkText]}>{displayName}</Text>
+            <Text style={styles.historyPhone}>{displayPhone}</Text>
+            {cleanNote ? (
+              <Text style={[styles.historyNotes, { color: isDark ? '#94A3B8' : '#334155' }]} numberOfLines={4}>
+                {cleanNote}
+              </Text>
+            ) : null}
+            {item.audio_recording && (
+              <TouchableOpacity 
+                style={styles.audioPlayerMini} 
+                onPress={() => playAudio(item.audio_recording, item.id.toString())}
+              >
+                <FontAwesome5 name={playingAudio === item.id.toString() ? 'stop-circle' : 'play-circle'} size={14} color="#3B82F6" />
+                <Text style={styles.audioTextMini}>{playingAudio === item.id.toString() ? 'Playing...' : 'Play Recording'}</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        </View>
+        <View style={{ alignItems: 'flex-end', justifyContent: 'space-between', minHeight: 40 }}>
+          <Text style={styles.historyTime}>{formattedTime}</Text>
+          {duration ? (
+            <View style={styles.durationBadge}>
+              <Text style={styles.durationText}>{duration}</Text>
+            </View>
+          ) : null}
+        </View>
+      </TouchableOpacity>
+    );
+  };
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  const hasAccess = ['SALES', 'TEAM_LEAD', 'SALES_HEAD', 'SALES_MANAGER', 'MANAGER', 'SALES_LEAD', 'ADMIN', 'SUPER_ADMIN'].includes(user?.role) || Boolean(user?.is_manager);
+  const isManager = canFilterByBde;
+  const selectedBdeObj = bdeExecutives.find((b: any) => String(b.id) === String(selectedBde));
+
+  const resolveStage = (raw: string): string => {
+    if (!raw) return 'New';
+    const fixed: Record<string, string> = {
+      NEW: 'New', FOLLOW_UP: 'Follow Up', PAYMENT_PENDING: 'Payment Pending',
+      ENROLLED: 'Enrolled', DROPPED: 'Dropped', CONTACTED: 'Contacted',
+    };
+    if (fixed[raw.toUpperCase()]) return fixed[raw.toUpperCase()];
+    const match = pipelineStages.find((s: any) => String(s.id) === String(raw) || s.name === raw);
+    if (match) return match.name;
+    return raw.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+  };
+
+  const stageStyle = (raw: string) => {
+    const s = (raw || '').toUpperCase();
+    if (s.includes('ENROL')) return { bg: '#D1FAE5', text: '#065F46', stripe: '#10B981' };
+    if (s === 'NEW') return { bg: '#DBEAFE', text: '#1E40AF', stripe: '#3B82F6' };
+    if (s.includes('PAYMENT') || s.includes('PENDING')) return { bg: '#FEF3C7', text: '#92400E', stripe: '#F59E0B' };
+    if (s.includes('FOLLOW')) return { bg: '#EDE9FE', text: '#5B21B6', stripe: '#8B5CF6' };
+    if (s.includes('DROP')) return { bg: '#FEE2E2', text: '#991B1B', stripe: '#EF4444' };
+    if (s.includes('CONTACT')) return { bg: '#E0F2FE', text: '#075985', stripe: '#0EA5E9' };
+    return { bg: '#F1F5F9', text: '#475569', stripe: '#94A3B8' };
+  };
+
+  const isSalesOnly = user?.role === 'SALES';
+
+  const filterOptions = [
+    { label: 'All', type: 'all', value: 'All' },
+    { label: 'Follow-ups', type: 'upcoming_followups', value: 'true' },
+    ...pipelineStages
+      .filter((s: any) => {
+        // No one should see the converted/enrolled stage filter on the Sales screen
+        const n = (s.name || '').toUpperCase();
+        const id = (String(s.id) || '').toUpperCase();
+        return !n.includes('ENROL') && !n.includes('CONVERT') && id !== 'ENROLLED' && id !== 'CONVERTED';
+      })
+      .map(s => ({ label: s.name, type: 'lead_status', value: s.id })),
+  ];
+
+  // ── Render lead row ───────────────────────────────────────────────────────
+  const renderLead = useCallback(({ item }: { item: any }) => {
+    const raw = item.lead_status || item.status || 'NEW';
+    const ss = stageStyle(raw);
+    const stageName = resolveStage(raw);
+    const phone = item.phone || item.mobile || '';
+    const campaignLabel = item.campaign_name || '';
+    const initials = ((item.first_name?.[0] || '') + (item.last_name?.[0] || '')).toUpperCase() || '?';
+
+    return (
+      <TouchableOpacity
+        style={[styles.leadRow, isDark && styles.leadRowDark]}
+        onPress={() => router.push({
+          pathname: '/lead-details',
+          params: {
+            leadId: String(item.id),
+            initialFirstName: item.first_name || '',
+            initialLastName: item.last_name || '',
+            initialMobile: item.mobile || item.phone || '',
+            initialEmail: item.email || '',
+            initialProgramName: item.program_name || item.program || '',
+            initialCourseName: item.course_name || item.course || '',
+            initialLeadStatus: item.lead_status || item.status || '',
+            initialCrmId: item.crm_student_id || '',
+            initialCampaignName: campaignLabel
+          }
+        } as any)}
+        activeOpacity={0.6}
+      >
+        {/* Left stage stripe */}
+        <View style={[styles.stripe, { backgroundColor: ss.stripe }]} />
+
+        {/* Avatar */}
+        <View style={[styles.avatar, { backgroundColor: ss.bg }]}>
+          <Text style={[styles.avatarTxt, { color: ss.text }]}>{initials}</Text>
+        </View>
+
+        {/* Info */}
+        <View style={styles.leadInfo}>
+          <Text style={[styles.leadName, isDark && { color: '#F1F5F9' }]} numberOfLines={1}>
+            {item.first_name} {item.last_name}
+          </Text>
+          <View style={styles.metaRow}>
+            <View style={[styles.stagePill, { backgroundColor: ss.bg }]}>
+              <Text style={[styles.stageTxt, { color: ss.text }]}>{stageName}</Text>
+            </View>
+            <View style={[styles.campaignPill, isDark && styles.campaignPillDark]}>
+              <FontAwesome5 name="bullhorn" size={9} color={isDark ? '#A5B4FC' : '#4F46E5'} />
+              <Text style={[styles.campaignTxt, isDark && { color: '#A5B4FC' }]} numberOfLines={1}>
+                {campaignLabel || 'Direct / Organic'}
+              </Text>
+            </View>
+            {item.program_name || item.program ? (
+              <Text style={styles.program} numberOfLines={1}>{item.program_name || item.program}</Text>
+            ) : null}
+          </View>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 3 }}>
+            {phone ? (
+              <Text style={[styles.phoneRow, { marginTop: 0 }, isDark && { color: '#64748B' }]} numberOfLines={1}>
+                {phone}
+              </Text>
+            ) : null}
+            {canFilterByBde && item.assigned_to_name ? (
+              <Text style={[styles.phoneRow, { marginTop: 0, color: '#6366F1', fontWeight: '700' }]} numberOfLines={1}>
+                • BDE: {item.assigned_to_name}
+              </Text>
+            ) : null}
+          </View>
+        </View>
+
+        {/* Call button */}
+        <TouchableOpacity
+          style={[styles.callBtn, { backgroundColor: isDark ? '#1E3A5F' : '#EFF6FF' }]}
+          onPress={() => {
+            if (phone) {
+              router.push({ pathname: '/dialpad', params: { leadId: item.id, phone } } as any);
+            } else {
+              Alert.alert('No Phone', 'This lead has no phone number.');
+            }
+          }}
+          hitSlop={{ top: 10, bottom: 10, left: 8, right: 8 }}
+        >
+          <FontAwesome5 name="phone-alt" size={14} color="#3B82F6" />
+        </TouchableOpacity>
+      </TouchableOpacity>
+    );
+  }, [isDark, pipelineStages, canFilterByBde]);
+
+  const renderLeadTaskCard = useCallback(({ item }: { item: any }) => {
+    const isCompleted = item.status === 'COMPLETED';
+    const isInProgress = item.status === 'IN_PROGRESS';
+    const badgeColor = isCompleted
+      ? { bg: '#D1FAE5', text: '#065F46', label: 'Completed' }
+      : isInProgress
+      ? { bg: '#DBEAFE', text: '#1E40AF', label: 'In Progress' }
+      : { bg: '#FEF3C7', text: '#92400E', label: 'Pending' };
+
+    const totalCount = (!canFilterByBde && item.my_leads_count !== undefined) ? item.my_leads_count : (item.total_leads || 0);
+    const completedCount = (!canFilterByBde && item.my_completed_leads !== undefined) ? item.my_completed_leads : (item.completed_leads || 0);
+    const percent = (!canFilterByBde && item.my_progress_percent !== undefined) ? item.my_progress_percent : (item.progress_percent || 0);
+
+    return (
+      <TouchableOpacity
+        style={[styles.taskCard, isDark && styles.taskCardDark]}
+        onPress={() => router.push({ pathname: '/task-details', params: { taskId: String(item.id) } } as any)}
+        activeOpacity={0.7}
+      >
+        <View style={styles.taskCardHeader}>
+          <View style={{ flex: 1, marginRight: 8 }}>
+            <Text style={[styles.taskCardTitle, isDark && { color: '#F1F5F9' }]} numberOfLines={1}>
+              {item.title}
+            </Text>
+            <Text style={styles.taskCardSub}>
+              Assigned to {item.assigned_to_name || 'You'} • {new Date(item.created_at).toLocaleDateString()}
+            </Text>
+          </View>
+          <View style={[styles.taskStatusBadge, { backgroundColor: badgeColor.bg }]}>
+            <Text style={[styles.taskStatusText, { color: badgeColor.text }]}>{badgeColor.label}</Text>
+          </View>
+        </View>
+
+        {/* Progress row */}
+        <View style={styles.taskProgressRow}>
+          <View style={styles.taskProgressTrack}>
+            <View
+              style={[
+                styles.taskProgressFill,
+                { width: `${percent}%` },
+                isCompleted && { backgroundColor: '#10B981' }
+              ]}
+            />
+          </View>
+          <Text style={styles.taskProgressText}>
+            {completedCount}/{totalCount} Leads ({percent}%)
+          </Text>
+        </View>
+
+        <View style={styles.taskCardFooter}>
+          <Text style={styles.taskCardAction}>Tap to view leads & follow-ups</Text>
+          <FontAwesome5 name="chevron-right" size={11} color="#3B82F6" />
+        </View>
+      </TouchableOpacity>
+    );
+  }, [isDark, canFilterByBde]);
+
+  // ── Guards ────────────────────────────────────────────────────────────────
+  if (authLoading) {
+    return (
+      <View style={[styles.center, isDark && styles.darkBg]}>
+        <ActivityIndicator size="large" color="#3B82F6" />
+      </View>
+    );
+  }
+
+  if (!hasAccess) {
+    return (
+      <View style={[styles.center, isDark && styles.darkBg]}>
+        <FontAwesome5 name="lock" size={40} color="#CBD5E1" />
+        <Text style={{ color: '#94A3B8', marginTop: 12, fontSize: 15, fontWeight: '700' }}>Restricted Access</Text>
+        <Text style={{ color: '#94A3B8', marginTop: 4, fontSize: 13, textAlign: 'center' }}>Sales personnel only</Text>
+      </View>
+    );
+  }
+
+  // ── Main render ───────────────────────────────────────────────────────────
+  return (
+    <View style={[styles.root, isDark && styles.darkBg]}>
+      <StatusBar barStyle={isDark ? 'light-content' : 'dark-content'} />
+
+      {/* ── HEADER ── */}
+      <View style={[styles.header, isDark && styles.headerDark, { paddingTop: Math.max(insets.top + 8, 16) }]}>
+        <View style={styles.headerTop}>
+          <View style={{ flex: 1, marginRight: 8 }}>
+            <Text style={[styles.headerTitle, isDark && { color: '#F1F5F9' }]}>Sales & Admissions</Text>
+            <Text style={[styles.headerSub, isDark && { color: '#64748B' }]} numberOfLines={1}>
+              {totalLeads > 0 ? `${totalLeads} leads` : 'Loading...'}
+              {mappedFolderInfo ? ` • ${mappedFolderInfo.folderName} (${mappedFolderInfo.audioRecordingsCount} rec)` : ''}
+            </Text>
+          </View>
+          {/* Map Folder — call recording */}
+          <TouchableOpacity
+            style={[styles.mapBtn, mappedFolderUri && { backgroundColor: '#10B981' }]}
+            onPress={handleMapFolderPress}
+          >
+            <FontAwesome5 name="folder-open" size={13} color="#fff" />
+            <Text style={styles.mapBtnTxt}>{mappedFolderUri ? 'Folder Mapped' : 'Map Folder'}</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* BDE Executive Filter (Admin / Team Lead / Super Admin) */}
+        {canFilterByBde && (
+          <View style={styles.bdeFilterRow}>
+            <TouchableOpacity
+              style={[
+                styles.bdeFilterBtn,
+                isDark && styles.bdeFilterBtnDark,
+                Boolean(selectedBde) && styles.bdeFilterBtnActive
+              ]}
+              onPress={() => setShowBdeModal(true)}
+            >
+              <FontAwesome5
+                name="user-tie"
+                size={12}
+                color={selectedBde ? '#FFFFFF' : (isDark ? '#94A3B8' : '#475569')}
+              />
+              <Text
+                style={[
+                  styles.bdeFilterTxt,
+                  isDark && { color: '#E2E8F0' },
+                  Boolean(selectedBde) && { color: '#FFFFFF' }
+                ]}
+                numberOfLines={1}
+              >
+                BDE Executive: {selectedBdeObj ? selectedBdeObj.name : 'All Executives'}
+              </Text>
+              <FontAwesome5
+                name="chevron-down"
+                size={10}
+                color={selectedBde ? '#FFFFFF' : '#94A3B8'}
+              />
+            </TouchableOpacity>
+            {Boolean(selectedBde) && (
+              <TouchableOpacity
+                style={styles.bdeClearBtn}
+                onPress={() => {
+                  setSelectedBde('');
+                  setCurrentPage(1);
+                }}
+              >
+                <FontAwesome5 name="times" size={11} color="#EF4444" />
+                <Text style={styles.bdeClearTxt}>All</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        )}
+
+        {/* Stats row — show to sales so they can see the converted count */}
+        {stats && (
+          <View style={styles.statsRow}>
+            <View style={[styles.statCard, { borderLeftColor: '#3B82F6' }]}>
+              <Text style={styles.statVal}>{stats.total_leads || 0}</Text>
+              <Text style={styles.statLbl}>Total</Text>
+            </View>
+            <View style={[styles.statCard, { borderLeftColor: '#EF4444' }]}>
+              <Text style={[styles.statVal, { color: '#EF4444' }]}>{stats.unassigned_leads || 0}</Text>
+              <Text style={styles.statLbl}>Unassigned</Text>
+            </View>
+            <View style={[styles.statCard, { borderLeftColor: '#10B981' }]}>
+              <Text style={[styles.statVal, { color: '#10B981' }]}>{stats.contacted_leads || 0}</Text>
+              <Text style={styles.statLbl}>Contacted</Text>
+            </View>
+            <View style={[styles.statCard, { borderLeftColor: '#F59E0B' }]}>
+              <Text style={[styles.statVal, { color: '#F59E0B' }]}>₹{stats.revenue || 0}</Text>
+              <Text style={styles.statLbl}>Revenue</Text>
+            </View>
+          </View>
+        )}
+
+        {/* Search bar */}
+        <View style={[styles.searchBar, isDark && styles.searchBarDark]}>
+          <FontAwesome5 name="search" size={14} color="#94A3B8" style={{ marginRight: 8 }} />
+          <TextInput
+            style={[styles.searchInput, isDark && { color: '#F1F5F9' }]}
+            placeholder="Search leads by name or phone..."
+            placeholderTextColor="#94A3B8"
+            value={search}
+            onChangeText={t => { setSearch(t); setCurrentPage(1); }}
+          />
+          {search.length > 0 && (
+            <TouchableOpacity onPress={() => setSearch('')} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+              <FontAwesome5 name="times-circle" size={15} color="#94A3B8" />
+            </TouchableOpacity>
+          )}
+        </View>
+
+        {/* View Mode Toggle */}
+        <View style={styles.tabContainer}>
+          <TouchableOpacity 
+            style={[styles.tabBtn, viewMode === 'NEW' && styles.tabBtnActive]} 
+            onPress={() => { setViewMode('NEW'); setCurrentPage(1); }}
+          >
+            <Text style={[styles.tabTxt, viewMode === 'NEW' && styles.tabTxtActive, isDark && viewMode === 'NEW' && { color: '#0F172A' }, isDark && viewMode !== 'NEW' && { color: '#94A3B8' }]}>New Leads</Text>
+          </TouchableOpacity>
+          <TouchableOpacity 
+            style={[styles.tabBtn, viewMode === 'PIPELINE' && styles.tabBtnActive]} 
+            onPress={() => { setViewMode('PIPELINE'); setCurrentPage(1); }}
+          >
+            <Text style={[styles.tabTxt, viewMode === 'PIPELINE' && styles.tabTxtActive, isDark && viewMode === 'PIPELINE' && { color: '#0F172A' }, isDark && viewMode !== 'PIPELINE' && { color: '#94A3B8' }]}>My Pipeline</Text>
+          </TouchableOpacity>
+          <TouchableOpacity 
+            style={[styles.tabBtn, viewMode === 'CALLS' && styles.tabBtnActive]} 
+            onPress={() => { setViewMode('CALLS'); setCurrentPage(1); }}
+          >
+            <Text style={[styles.tabTxt, viewMode === 'CALLS' && styles.tabTxtActive, isDark && viewMode === 'CALLS' && { color: '#0F172A' }, isDark && viewMode !== 'CALLS' && { color: '#94A3B8' }]}>Recent Calls</Text>
+          </TouchableOpacity>
+          <TouchableOpacity 
+            style={[styles.tabBtn, viewMode === 'TASKS' && styles.tabBtnActive]} 
+            onPress={() => { setViewMode('TASKS'); }}
+          >
+            <Text style={[styles.tabTxt, viewMode === 'TASKS' && styles.tabTxtActive, isDark && viewMode === 'TASKS' && { color: '#0F172A' }, isDark && viewMode !== 'TASKS' && { color: '#94A3B8' }]}>Tasks</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Filter controls row */}
+        <View style={styles.controlRow}>
+          <TouchableOpacity
+            style={[styles.controlBtn, showFilters && { backgroundColor: '#3B82F6' }]}
+            onPress={() => setShowFilters(f => !f)}
+          >
+            <FontAwesome5 name="filter" size={11} color={showFilters ? '#fff' : '#64748B'} />
+            <Text style={[styles.controlTxt, showFilters && { color: '#fff' }]}>Filter</Text>
+            {selectedFilter.type !== 'all' && (
+              <View style={styles.filterDot} />
+            )}
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.controlBtn}
+            onPress={() => setSortOrder(p => p === '-id' ? 'id' : '-id')}
+          >
+            <FontAwesome5 name={sortOrder === '-id' ? 'sort-amount-down' : 'sort-amount-up'} size={11} color="#64748B" />
+            <Text style={styles.controlTxt}>{sortOrder === '-id' ? 'Newest' : 'Oldest'}</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.controlBtn, (startDate || endDate) && { backgroundColor: '#3B82F6' }]}
+            onPress={() => setShowPicker('start')}
+          >
+            <FontAwesome5 name="calendar-alt" size={11} color={(startDate || endDate) ? '#fff' : '#64748B'} />
+            <Text style={[styles.controlTxt, (startDate || endDate) && { color: '#fff' }]}>
+              {startDate && endDate ? `${startDate.toLocaleDateString('en-GB', {day:'2-digit', month:'short'})} - ${endDate.toLocaleDateString('en-GB', {day:'2-digit', month:'short'})}` : (startDate ? 'Start Date Set' : 'Dates')}
+            </Text>
+            {(startDate || endDate) && (
+              <TouchableOpacity onPress={() => { setStartDate(null); setEndDate(null); setCurrentPage(1); }} style={{ marginLeft: 4 }}>
+                <FontAwesome5 name="times-circle" size={11} color="#fff" />
+              </TouchableOpacity>
+            )}
+          </TouchableOpacity>
+
+          {selectedFilter.type !== 'all' && (
+            <View style={styles.activeFilter}>
+              <Text style={styles.activeFilterTxt}>{selectedFilter.label}</Text>
+              <TouchableOpacity onPress={() => { setSelectedFilter({ label: 'All', type: 'all', value: 'All' }); setCurrentPage(1); }}>
+                <FontAwesome5 name="times" size={9} color="#3B82F6" style={{ marginLeft: 4 }} />
+              </TouchableOpacity>
+            </View>
+          )}
+        </View>
+
+        {/* Expandable filter pills */}
+        {showFilters && (
+          <View style={styles.pillsWrap}>
+            {filterOptions.map((f, i) => {
+              const active = selectedFilter.type === f.type && selectedFilter.value === f.value;
+              return (
+                <TouchableOpacity
+                  key={i}
+                  style={[styles.pill, active && styles.pillActive, isDark && !active && styles.pillDark]}
+                  onPress={() => { setSelectedFilter(f); setCurrentPage(1); setShowFilters(false); }}
+                >
+                  <Text style={[styles.pillTxt, active && styles.pillTxtActive, isDark && !active && { color: '#94A3B8' }]}>
+                    {f.label}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+        )}
+
+        {showPicker && (
+          <DateTimePicker
+            value={showPicker === 'start' ? (startDate || new Date()) : (endDate || new Date())}
+            mode="date"
+            display="default"
+            onChange={(event, date) => {
+              if (event.type === 'dismissed') {
+                setShowPicker(null);
+                return;
+              }
+              if (date) {
+                if (showPicker === 'start') {
+                  setStartDate(date);
+                  setShowPicker('end'); // Ask for end date next
+                } else {
+                  setEndDate(date);
+                  setShowPicker(null);
+                }
+              }
+            }}
+          />
+        )}
+      </View>
+
+      {/* ── TASKS LIST or RECENT CALLS or LEADS LIST ── */}
+      {viewMode === 'TASKS' ? (
+        loadingLeadTasks && !refreshing ? (
+          <View style={styles.center}>
+            <ActivityIndicator size="large" color="#3B82F6" />
+            <Text style={{ color: '#94A3B8', marginTop: 10, fontSize: 13 }}>Loading tasks...</Text>
+          </View>
+        ) : (
+          <FlatList
+            data={search ? leadTasks.filter(t => t.title?.toLowerCase().includes(search.toLowerCase())) : leadTasks}
+            renderItem={renderLeadTaskCard}
+            keyExtractor={(item) => item.id.toString()}
+            contentContainerStyle={styles.listContent}
+            refreshing={refreshing}
+            onRefresh={async () => {
+              setRefreshing(true);
+              await fetchLeadTasks();
+              setRefreshing(false);
+            }}
+            ListEmptyComponent={
+              <View style={styles.center}>
+                <FontAwesome5 name="check-circle" size={36} color="#CBD5E1" />
+                <Text style={{ color: '#94A3B8', marginTop: 10, fontSize: 14, fontWeight: '600' }}>No tasks found</Text>
+                <Text style={{ color: '#CBD5E1', fontSize: 12, marginTop: 4 }}>
+                  {search ? 'No tasks match your search' : 'You currently have no tasks assigned to you.'}
+                </Text>
+              </View>
+            }
+          />
+        )
+      ) : viewMode === 'CALLS' ? (
+        loadingCalls && !refreshing ? (
+          <View style={styles.center}>
+            <ActivityIndicator size="large" color="#3B82F6" />
+            <Text style={{ color: '#94A3B8', marginTop: 10, fontSize: 13 }}>Loading recent calls...</Text>
+          </View>
+        ) : (
+          <FlatList
+            data={recentCalls}
+            renderItem={renderRecentCall}
+            keyExtractor={(item) => item.id.toString()}
+            contentContainerStyle={styles.listContent}
+            refreshing={refreshing}
+            onRefresh={async () => {
+              setRefreshing(true);
+              await fetchRecentCalls(1, true);
+              setRefreshing(false);
+            }}
+            onEndReached={handleLoadMore}
+            onEndReachedThreshold={0.4}
+            ListEmptyComponent={
+              <View style={styles.center}>
+                <FontAwesome5 name="phone-slash" size={36} color="#CBD5E1" />
+                <Text style={{ color: '#94A3B8', marginTop: 10, fontSize: 14, fontWeight: '600' }}>No recent calls found</Text>
+              </View>
+            }
+            ListFooterComponent={
+              loadingMoreCalls ? (
+                <View style={{ padding: 16, alignItems: 'center' }}>
+                  <ActivityIndicator size="small" color="#3B82F6" />
+                </View>
+              ) : recentCalls.length > 0 && !hasMoreCalls ? (
+                <Text style={{ textAlign: 'center', color: '#CBD5E1', fontSize: 12, padding: 16 }}>
+                  All recent calls loaded
+                </Text>
+              ) : null
+            }
+          />
+        )
+      ) : (
+        loading && !refreshing ? (
+          <View style={styles.center}>
+            <ActivityIndicator size="large" color="#3B82F6" />
+            <Text style={{ color: '#94A3B8', marginTop: 10, fontSize: 13 }}>Loading leads...</Text>
+          </View>
+        ) : (
+          <FlatList
+            data={leads}
+            renderItem={renderLead}
+            keyExtractor={(item, i) => item.id?.toString() || i.toString()}
+            contentContainerStyle={styles.listContent}
+            refreshing={refreshing}
+            onRefresh={handleRefresh}
+            onEndReached={handleLoadMore}
+            onEndReachedThreshold={0.4}
+            ListEmptyComponent={
+              <View style={styles.center}>
+                <FontAwesome5 name="inbox" size={36} color="#CBD5E1" />
+                <Text style={{ color: '#94A3B8', marginTop: 10, fontSize: 14, fontWeight: '600' }}>No leads found</Text>
+                {search ? <Text style={{ color: '#CBD5E1', fontSize: 12, marginTop: 4 }}>Try a different search</Text> : null}
+              </View>
+            }
+            ListFooterComponent={
+              loadingMore ? (
+                <View style={{ padding: 16, alignItems: 'center' }}>
+                  <ActivityIndicator size="small" color="#3B82F6" />
+                </View>
+              ) : leads.length >= totalLeads && leads.length > 0 ? (
+                <Text style={{ textAlign: 'center', color: '#CBD5E1', fontSize: 12, padding: 16 }}>
+                  All {totalLeads} leads loaded
+                </Text>
+              ) : null
+            }
+          />
+        )
+      )}
+
+      {/* ── BDE EXECUTIVE FILTER MODAL ── */}
+      <Modal
+        visible={showBdeModal}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowBdeModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalSheet, isDark && styles.modalSheetDark]}>
+            <View style={styles.modalHeader}>
+              <Text style={[styles.modalTitle, isDark && { color: '#F1F5F9' }]}>Filter by BDE Executive</Text>
+              <TouchableOpacity onPress={() => setShowBdeModal(false)} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                <FontAwesome5 name="times" size={16} color="#94A3B8" />
+              </TouchableOpacity>
+            </View>
+
+            <View style={[styles.searchBar, isDark && styles.searchBarDark, { marginBottom: 10 }]}>
+              <FontAwesome5 name="search" size={13} color="#94A3B8" style={{ marginRight: 8 }} />
+              <TextInput
+                style={[styles.searchInput, isDark && { color: '#F1F5F9' }]}
+                placeholder="Search BDE executive..."
+                placeholderTextColor="#94A3B8"
+                value={bdeSearch}
+                onChangeText={setBdeSearch}
+              />
+              {bdeSearch.length > 0 && (
+                <TouchableOpacity onPress={() => setBdeSearch('')}>
+                  <FontAwesome5 name="times-circle" size={14} color="#94A3B8" />
+                </TouchableOpacity>
+              )}
+            </View>
+
+            <ScrollView style={{ maxHeight: 360 }} showsVerticalScrollIndicator={false}>
+              <TouchableOpacity
+                style={[
+                  styles.bdeOptionItem,
+                  !selectedBde && styles.bdeOptionItemActive,
+                  isDark && styles.bdeOptionItemDark
+                ]}
+                onPress={() => {
+                  setSelectedBde('');
+                  setCurrentPage(1);
+                  setShowBdeModal(false);
+                }}
+              >
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                  <FontAwesome5 name="users" size={14} color={!selectedBde ? '#3B82F6' : '#64748B'} />
+                  <Text style={[styles.bdeOptionTxt, isDark && { color: '#F1F5F9' }, !selectedBde && { color: '#3B82F6', fontWeight: '800' }]}>
+                    All BDE Executives
+                  </Text>
+                </View>
+                {!selectedBde && <FontAwesome5 name="check" size={13} color="#3B82F6" />}
+              </TouchableOpacity>
+
+              {bdeExecutives
+                .filter((b: any) => !bdeSearch || (b.name || '').toLowerCase().includes(bdeSearch.toLowerCase()))
+                .map((bde: any) => {
+                  const isSelected = String(selectedBde) === String(bde.id);
+                  return (
+                    <TouchableOpacity
+                      key={bde.id}
+                      style={[
+                        styles.bdeOptionItem,
+                        isSelected && styles.bdeOptionItemActive,
+                        isDark && styles.bdeOptionItemDark
+                      ]}
+                      onPress={() => {
+                        setSelectedBde(String(bde.id));
+                        setCurrentPage(1);
+                        setShowBdeModal(false);
+                      }}
+                    >
+                      <View style={{ flex: 1 }}>
+                        <Text style={[styles.bdeOptionTxt, isDark && { color: '#F1F5F9' }, isSelected && { color: '#3B82F6', fontWeight: '800' }]}>
+                          {bde.name}
+                        </Text>
+                        {bde.sales_section && bde.sales_section !== 'BOTH' && (
+                          <Text style={{ fontSize: 10, color: '#94A3B8', marginTop: 2 }}>
+                            Section: {bde.sales_section === 'CAREER_ACADEMY' ? 'Career Academy' : 'Regular'}
+                          </Text>
+                        )}
+                      </View>
+                      {isSelected && <FontAwesome5 name="check" size={13} color="#3B82F6" />}
+                    </TouchableOpacity>
+                  );
+                })}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+    </View>
+  );
+}
+
+// ── STYLES ─────────────────────────────────────────────────────────────────
+const styles = StyleSheet.create({
+  root: { flex: 1, backgroundColor: '#F8FAFC' },
+  darkBg: { backgroundColor: '#0F172A' },
+  center: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20 },
+
+  // Header
+  header: {
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 16,
+    paddingBottom: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: '#E2E8F0',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.04,
+    shadowRadius: 4,
+    elevation: 2,
+  },
+  headerDark: { backgroundColor: '#1E293B', borderBottomColor: '#334155' },
+  headerTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
+  headerTitle: { fontSize: 20, fontWeight: '900', color: '#0F172A', letterSpacing: -0.3 },
+  headerSub: { fontSize: 12, color: '#94A3B8', fontWeight: '600', marginTop: 1 },
+
+  // Map Folder (call recording)
+  mapBtn: {
+    flexDirection: 'row', alignItems: 'center', gap: 6,
+    backgroundColor: '#F59E0B', paddingHorizontal: 12, paddingVertical: 7,
+    borderRadius: 20,
+  },
+  mapBtnTxt: { color: '#fff', fontSize: 12, fontWeight: '800' },
+
+  // Stats
+  statsRow: { flexDirection: 'row', gap: 8, marginBottom: 12 },
+  statCard: {
+    flex: 1, backgroundColor: '#F8FAFC', borderRadius: 10,
+    paddingVertical: 8, paddingHorizontal: 8, borderLeftWidth: 3,
+  },
+  statVal: { fontSize: 15, fontWeight: '900', color: '#1E293B' },
+  statLbl: { fontSize: 9, fontWeight: '700', color: '#94A3B8', marginTop: 1, textTransform: 'uppercase' },
+
+  // Search
+  searchBar: {
+    flexDirection: 'row', alignItems: 'center',
+    backgroundColor: '#F1F5F9', borderRadius: 12,
+    paddingHorizontal: 12, paddingVertical: 6,
+    marginBottom: 6, borderWidth: 1, borderColor: '#E2E8F0',
+  },
+  searchBarDark: { backgroundColor: '#0F172A', borderColor: '#334155' },
+  searchInput: { flex: 1, fontSize: 14, color: '#1E293B', fontWeight: '500' },
+
+  // Tabs
+  tabContainer: {
+    flexDirection: 'row', backgroundColor: '#F1F5F9', borderRadius: 8, padding: 4, marginBottom: 8
+  },
+  tabBtn: {
+    flex: 1, paddingVertical: 6, alignItems: 'center', borderRadius: 6
+  },
+  tabBtnActive: {
+    backgroundColor: '#FFFFFF', shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, shadowRadius: 2, elevation: 2
+  },
+  tabTxt: {
+    fontSize: 13, fontWeight: '600', color: '#64748B'
+  },
+  tabTxtActive: {
+    color: '#0F172A', fontWeight: '700'
+  },
+
+  // Controls
+  controlRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 6 },
+  controlBtn: {
+    flexDirection: 'row', alignItems: 'center', gap: 5,
+    backgroundColor: '#F1F5F9', paddingHorizontal: 10, paddingVertical: 6,
+    borderRadius: 20, position: 'relative',
+  },
+  controlTxt: { fontSize: 12, fontWeight: '700', color: '#64748B' },
+  filterDot: {
+    position: 'absolute', top: 3, right: 3,
+    width: 6, height: 6, borderRadius: 3, backgroundColor: '#F59E0B',
+  },
+  activeFilter: {
+    flexDirection: 'row', alignItems: 'center',
+    backgroundColor: '#EFF6FF', paddingHorizontal: 10, paddingVertical: 6,
+    borderRadius: 20, borderWidth: 1, borderColor: '#BFDBFE',
+  },
+  activeFilterTxt: { fontSize: 11, fontWeight: '800', color: '#3B82F6' },
+
+  // Filter pills
+  pillsWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, paddingBottom: 4 },
+  pill: {
+    paddingHorizontal: 12, paddingVertical: 5, borderRadius: 20,
+    backgroundColor: '#F1F5F9', borderWidth: 1, borderColor: '#E2E8F0',
+  },
+  pillDark: { backgroundColor: '#1E293B', borderColor: '#334155' },
+  pillActive: { backgroundColor: '#3B82F6', borderColor: '#3B82F6' },
+  pillTxt: { fontSize: 12, fontWeight: '700', color: '#64748B' },
+  pillTxtActive: { color: '#FFFFFF' },
+
+  // List
+  listContent: { paddingVertical: 4 },
+
+  // Lead row
+  leadRow: {
+    flexDirection: 'row', alignItems: 'center',
+    backgroundColor: '#FFFFFF',
+    paddingVertical: 6, paddingRight: 10,
+    borderBottomWidth: 1, borderBottomColor: '#F1F5F9',
+    minHeight: 55,
+  },
+  leadRowDark: { backgroundColor: '#1E293B', borderBottomColor: '#334155' },
+  stripe: { width: 4, alignSelf: 'stretch', borderRadius: 0 },
+  avatar: {
+    width: 38, height: 38, borderRadius: 12,
+    alignItems: 'center', justifyContent: 'center',
+    marginHorizontal: 10, flexShrink: 0,
+  },
+  avatarTxt: { fontSize: 13, fontWeight: '900' },
+  leadInfo: { flex: 1, marginRight: 8 },
+  leadName: { fontSize: 14, fontWeight: '800', color: '#0F172A', marginBottom: 3 },
+  metaRow: { flexDirection: 'row', alignItems: 'center', gap: 6, flexWrap: 'wrap' },
+  stagePill: {
+    paddingHorizontal: 7, paddingVertical: 2, borderRadius: 6,
+  },
+  stageTxt: { fontSize: 10, fontWeight: '800', letterSpacing: 0.2 },
+  campaignPill: {
+    flexDirection: 'row', alignItems: 'center', gap: 4,
+    backgroundColor: '#EEF2FF', paddingHorizontal: 7, paddingVertical: 2,
+    borderRadius: 6, borderWidth: 1, borderColor: '#E0E7FF', maxWidth: 150,
+  },
+  campaignPillDark: {
+    backgroundColor: '#1E1B4B', borderColor: '#312E81',
+  },
+  campaignTxt: { fontSize: 10, fontWeight: '700', color: '#4F46E5', flexShrink: 1 },
+  program: { fontSize: 10, color: '#F59E0B', fontWeight: '700', flexShrink: 1 },
+  phoneRow: { fontSize: 11, color: '#94A3B8', marginTop: 3, fontWeight: '500' },
+
+  // BDE Executive Filter
+  bdeFilterRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8,
+  },
+  bdeFilterBtn: {
+    flex: 1, flexDirection: 'row', alignItems: 'center', gap: 8,
+    backgroundColor: '#F8FAFC', borderWidth: 1, borderColor: '#CBD5E1',
+    paddingHorizontal: 12, paddingVertical: 7, borderRadius: 10,
+  },
+  bdeFilterBtnDark: {
+    backgroundColor: '#0F172A', borderColor: '#334155',
+  },
+  bdeFilterBtnActive: {
+    backgroundColor: '#3B82F6', borderColor: '#2563EB',
+  },
+  bdeFilterTxt: {
+    flex: 1, fontSize: 12, fontWeight: '700', color: '#334155',
+  },
+  bdeClearBtn: {
+    flexDirection: 'row', alignItems: 'center', gap: 4,
+    backgroundColor: '#FEF2F2', borderWidth: 1, borderColor: '#FECACA',
+    paddingHorizontal: 10, paddingVertical: 7, borderRadius: 10,
+  },
+  bdeClearTxt: {
+    fontSize: 11, fontWeight: '800', color: '#EF4444',
+  },
+  modalOverlay: {
+    flex: 1, backgroundColor: 'rgba(15, 23, 42, 0.5)',
+    justifyContent: 'flex-end',
+  },
+  modalSheet: {
+    backgroundColor: '#FFFFFF', borderTopLeftRadius: 20, borderTopRightRadius: 20,
+    padding: 18, paddingBottom: 28,
+  },
+  modalSheetDark: {
+    backgroundColor: '#1E293B',
+  },
+  modalHeader: {
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+    marginBottom: 14,
+  },
+  modalTitle: {
+    fontSize: 16, fontWeight: '800', color: '#0F172A',
+  },
+  bdeOptionItem: {
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+    paddingVertical: 12, paddingHorizontal: 12, borderRadius: 10,
+    borderBottomWidth: 1, borderBottomColor: '#F1F5F9',
+  },
+  bdeOptionItemDark: {
+    borderBottomColor: '#334155',
+  },
+  bdeOptionItemActive: {
+    backgroundColor: '#EFF6FF',
+  },
+  bdeOptionTxt: {
+    fontSize: 14, fontWeight: '600', color: '#1E293B',
+  },
+
+  // Call button
+  callBtn: {
+    width: 36, height: 36, borderRadius: 12,
+    alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+  },
+  historyCard: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F3F4F6',
+  },
+  historyLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flex: 1,
+    marginRight: 10,
+  },
+  historyIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#EBF8FF',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  historyName: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#1F2937',
+  },
+  historyPhone: {
+    fontSize: 13,
+    color: '#6B7280',
+    marginTop: 2,
+  },
+  historyNotes: {
+    fontSize: 12,
+    color: '#9CA3AF',
+    marginTop: 4,
+  },
+  historyTime: {
+    fontSize: 11,
+    color: '#9CA3AF',
+  },
+  durationBadge: {
+    backgroundColor: '#F3F4F6',
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 10,
+    marginTop: 6,
+  },
+  durationText: {
+    fontSize: 10,
+    fontWeight: '600',
+    color: '#4B5563',
+  },
+  audioPlayerMini: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#EFF6FF',
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 6,
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: '#BFDBFE',
+    alignSelf: 'flex-start',
+  },
+  audioTextMini: {
+    marginLeft: 6,
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#1E40AF',
+  },
+
+  // ── Lead Tasks Styles ──
+  taskCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.04,
+    shadowRadius: 3,
+    elevation: 1,
+  },
+  taskCardDark: {
+    backgroundColor: '#1E293B',
+    borderColor: '#334155',
+  },
+  taskCardHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    marginBottom: 10,
+  },
+  taskCardTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#0F172A',
+  },
+  taskCardSub: {
+    fontSize: 11,
+    color: '#64748B',
+    marginTop: 2,
+  },
+  taskStatusBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 10,
+  },
+  taskStatusText: {
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  taskProgressRow: {
+    marginVertical: 4,
+  },
+  taskProgressTrack: {
+    height: 6,
+    backgroundColor: '#F1F5F9',
+    borderRadius: 3,
+    overflow: 'hidden',
+    marginBottom: 6,
+  },
+  taskProgressFill: {
+    height: '100%',
+    backgroundColor: '#3B82F6',
+    borderRadius: 3,
+  },
+  taskProgressText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#64748B',
+    textAlign: 'right',
+  },
+  taskCardFooter: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: 8,
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: '#F1F5F9',
+  },
+  taskCardAction: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#3B82F6',
+  },
+});

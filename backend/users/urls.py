@@ -1,0 +1,20 @@
+
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
+from .views import LoginView, LogoutView, PasswordChangeView, UserDetailView, UserViewSet, MentorListView, TeacherListView, TeacherViewSet, RolePermissionViewSet, ExpoTokenView
+
+router = DefaultRouter()
+router.register(r'users', UserViewSet, basename='user')
+router.register(r'teachers', TeacherViewSet, basename='teacher-management')
+router.register(r'permissions', RolePermissionViewSet)
+
+urlpatterns = [
+    path('login/', LoginView.as_view(), name='login'),
+    path('logout/', LogoutView.as_view(), name='logout'),
+    path('change-password/', PasswordChangeView.as_view(), name='change-password'),
+    path('me/', UserDetailView.as_view(), name='user-detail'),
+    path('mentors/', MentorListView.as_view(), name='mentor-list'),
+    path('teachers/', TeacherListView.as_view(), name='teacher-list'),
+    path('management/', include(router.urls)),
+    path('expo-token/', ExpoTokenView.as_view(), name='expo-token'),
+]

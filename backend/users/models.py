@@ -1,0 +1,127 @@
+from django.contrib.auth.models import AbstractUser
+from django.db import models
+from django.utils import timezone
+
+class User(AbstractUser):
+    ROLE_CHOICES = (
+        ('SUPER_ADMIN', 'Super Admin'),
+        ('ADMIN', 'Admin'),
+        ('SALES', 'Sales User'),
+        ('MENTOR', 'Mentor'),
+        ('ACADEMIC', 'Academic User'),
+        ('ACADEMIC_COORDINATOR', 'Academic Coordinator'),
+        ('TEACHER', 'Teacher'),
+        ('STUDENT', 'Student'),
+        ('EMPLOYEE', 'General Employee'),
+        ('MARKETER', 'Digital Marketer'),
+    )
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='STUDENT')
+    phone_number = models.CharField(max_length=15, blank=True, null=True)
+    lms_teacher_id = models.CharField(max_length=100, blank=True, null=True, help_text="Wise LMS Teacher ID")
+    expo_push_token = models.CharField(max_length=255, blank=True, null=True)
+    
+    SALES_SECTION_CHOICES = (
+        ('CAREER_ACADEMY', 'Career Academy'),
+        ('REGULAR', 'Regular'),
+        ('BOTH', 'Both'),
+    )
+    sales_section = models.CharField(max_length=20, choices=SALES_SECTION_CHOICES, default='BOTH')
+    
+    # Hierarchy for mentors (TL, Manager, etc.)
+    reports_to = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='subordinates', help_text="The person this user reports to (e.g. TL or Manager)")
+
+    class Meta:
+        ordering = ['-id']
+
+    def __str__(self):
+        return f"{self.username} ({self.role})"
+        
+    def get_all_subordinates(self):
+        """Recursively get all users who report to this user."""
+        subordinates = list(self.subordinates.all())
+        all_subs = list(subordinates)
+        for sub in subordinates:
+            all_subs.extend(sub.get_all_subordinates())
+        return all_subs
+
+class RolePermission(models.Model):
+    MODULE_CHOICES = (
+        ('SALES', 'Sales & Leads'),
+        ('CRM_DASHBOARD', 'CRM Dashboard'),
+        ('CRM_CAMPAIGNS', 'CRM Campaigns'),
+        ('CRM_PIPELINE', 'CRM Pipeline'),
+        ('CRM_LEADS_TABLE', 'CRM Leads Table'),
+        ('CRM_TASKS', 'CRM Tasks'),
+        ('CRM_REPORTS', 'CRM Team Reports'),
+        ('CRM_CALL_ANALYTICS', 'CRM Call Analytics'),
+        ('MENTOR', 'Mentor Module'),
+        ('STUDENT', 'Student Portal'),
+        ('ACADEMIC_HIERARCHY', 'Academic Hierarchy'),
+        ('COORDINATOR', 'Coordinator Module'),
+        ('TEACHER', 'Teacher Module'),
+        ('COURSES', 'Courses & Batches'),
+        ('ANALYTICS', 'Analytics & Reports'),
+        ('WORKFORCE', 'HRMS: Workforce Hub'),
+        ('ATTENDANCE', 'HRMS: Attendance'),
+        ('PAYROLL', 'HRMS: Payroll'),
+        ('STAFF_DIRECTORY', 'Staff Directory'),
+        ('ADMIN', 'Administrator Portal'),
+    )
+    role = models.CharField(max_length=20, choices=User.ROLE_CHOICES)
+    module = models.CharField(max_length=20, choices=MODULE_CHOICES)
+    
+    can_view = models.BooleanField(default=False)
+    can_add = models.BooleanField(default=False)
+    can_edit = models.BooleanField(default=False)
+    can_delete = models.BooleanField(default=False)
+
+    class Meta:
+        unique_together = ('role', 'module')
+
+    def __str__(self):
+        return f"{self.role} - {self.module} Permissions"
+
+class Teacher(User):
+    class Meta:
+        proxy = True
+        verbose_name = 'Teacher'
+        verbose_name_plural = 'Teachers'
+
+    def save(self, *args, **kwargs):
+        self.role = 'TEACHER'
+        super().save(*args, **kwargs)
+
+
+class UserAuthToken(models.Model):
+    """
+    Multi-device / multi-session authentication token.
+    Allows multiple active tokens per user across different devices/phones.
+    """
+    key = models.CharField(max_length=64, primary_key=True, db_index=True)
+    user = models.ForeignKey(
+        'users.User',
+        related_name='auth_tokens',
+        on_delete=models.CASCADE
+    )
+    created = models.DateTimeField(default=timezone.now)
+    last_used = models.DateTimeField(default=timezone.now)
+    device_name = models.CharField(max_length=255, blank=True, default='')
+
+    class Meta:
+        ordering = ['-created']
+        verbose_name = 'User Auth Token'
+        verbose_name_plural = 'User Auth Tokens'
+
+    def save(self, *args, **kwargs):
+        if not self.key:
+            self.key = self.generate_key()
+        return super().save(*args, **kwargs)
+
+    @classmethod
+    def generate_key(cls):
+        import binascii
+        import os
+        return binascii.hexlify(os.urandom(20)).decode()
+
+    def __str__(self):
+        return f"{self.user.username} ({self.key[:8]}...)"

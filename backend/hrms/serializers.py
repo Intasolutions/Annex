@@ -1,0 +1,313 @@
+from rest_framework import serializers
+from core.validators import (
+    validate_employee_document_file,
+    validate_profile_photo_file,
+    validate_receipt_file
+)
+from .models import Department, Designation, EmployeeProfile, CustomField, Attendance, ShiftSetting, Task, TaskComment, CompanyPost, EmployeeDocument, Asset, Expense, PerformanceReview, Offboarding
+
+class ShiftSettingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ShiftSetting
+        fields = '__all__'
+
+class AttendanceSerializer(serializers.ModelSerializer):
+    employee_name = serializers.ReadOnlyField(source='employee.user.get_full_name')
+    employee_id_display = serializers.ReadOnlyField(source='employee.employee_id')
+    user_id = serializers.ReadOnlyField(source='employee.user.id')
+    is_missed_clock_out = serializers.SerializerMethodField()
+    duration_display = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = Attendance
+        fields = [
+            'id', 'employee', 'user_id', 'employee_name', 'employee_id_display', 
+            'date', 'clock_in', 'clock_out', 
+            'clock_in_latitude', 'clock_in_longitude',
+            'clock_out_latitude', 'clock_out_longitude',
+            'clock_in_photo', 'is_face_verified', 'verification_confidence',
+            'status', 'notes', 'is_missed_clock_out', 'duration_display'
+        ]
+        read_only_fields = ['id', 'date', 'status']
+
+    def get_is_missed_clock_out(self, obj):
+        return bool(obj.clock_in and not obj.clock_out)
+
+    def get_duration_display(self, obj):
+        if not obj.clock_in or not obj.clock_out:
+            return '--'
+        from datetime import datetime, date
+        dummy_date = date(2000, 1, 1)
+        start = datetime.combine(dummy_date, obj.clock_in)
+        end = datetime.combine(dummy_date, obj.clock_out)
+        diff_secs = (end - start).total_seconds()
+        if diff_secs < 0:
+            diff_secs += 86400
+        hours = int(diff_secs // 3600)
+        minutes = int((diff_secs % 3600) // 60)
+        return f"{hours}h {minutes}m"
+from django.contrib.auth import get_user_model
+
+User = get_user_model()
+
+class DepartmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Department
+        fields = '__all__'
+
+class CustomFieldSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CustomField
+        fields = '__all__'
+
+class DesignationSerializer(serializers.ModelSerializer):
+    department_name = serializers.ReadOnlyField(source='department.name')
+    
+    class Meta:
+        model = Designation
+        fields = ['id', 'name', 'department', 'department_name', 'description', 'permission_role', 'created_at']
+
+class EmployeeProfileSerializer(serializers.ModelSerializer):
+    username = serializers.CharField(write_only=True, required=False)
+    password = serializers.CharField(write_only=True, required=False)
+    email = serializers.EmailField(write_only=True, required=False)
+    first_name = serializers.CharField(write_only=True, required=False)
+    last_name = serializers.CharField(write_only=True, required=False)
+    
+    # Read-only fields for display
+    display_username = serializers.ReadOnlyField(source='user.username')
+    full_name = serializers.ReadOnlyField(source='user.get_full_name')
+    department_name = serializers.ReadOnlyField(source='department.name')
+    designation_name = serializers.ReadOnlyField(source='designation.name')
+    reporting_to_name = serializers.ReadOnlyField(source='reporting_to.user.get_full_name')
+    documents = serializers.SerializerMethodField()
+
+    def get_documents(self, obj):
+        from .serializers import EmployeeDocumentSerializer
+        return EmployeeDocumentSerializer(obj.documents.all(), many=True).data
+    
+    class Meta:
+        model = EmployeeProfile
+        fields = [
+            'id', 'username', 'password', 'email', 'first_name', 'last_name',
+            'display_username', 'full_name', 'employee_id', 'department', 
+            'department_name', 'designation', 'designation_name', 
+            'reporting_to', 'reporting_to_name', 'date_of_birth', 'gender', 
+            'profile_photo', 'date_of_joining', 'employment_type', 'status', 'work_location',
+            'base_salary', 'documents', 'additional_data'
+        ]
+        read_only_fields = ['id', 'status']
+
+    def to_internal_value(self, data):
+        # Defensive fix: If profile_photo is passed as a string (such as an existing photo URL/path echoed back by clients),
+        # strip it so DRF's ImageField does not reject it as an invalid file, preserving the existing photo on partial update.
+        if isinstance(data, dict) and 'profile_photo' in data and isinstance(data['profile_photo'], str):
+            data = data.copy()
+            data.pop('profile_photo', None)
+        elif hasattr(data, '_mutable') and 'profile_photo' in data and isinstance(data.get('profile_photo'), str):
+            data = data.copy()
+            data.pop('profile_photo', None)
+        return super().to_internal_value(data)
+
+    def validate_profile_photo(self, value):
+        if value:
+            return validate_profile_photo_file(value)
+        return value
+
+    def validate(self, attrs):
+        # On create, check that required user fields are present
+        if not self.instance:
+            required_fields = ['username', 'email', 'first_name', 'last_name', 'password']
+            for field in required_fields:
+                if field not in attrs or not attrs[field]:
+                    raise serializers.ValidationError({field: "This field is required on employee creation."})
+        return attrs
+
+    def create(self, validated_data):
+        user_data = {
+            'username': validated_data.pop('username'),
+            'email': validated_data.pop('email'),
+            'first_name': validated_data.pop('first_name'),
+            'last_name': validated_data.pop('last_name'),
+        }
+        password = validated_data.pop('password')
+        
+        # Create the user with the EMPLOYEE role
+        user = User.objects.create_user(**user_data, password=password, role='EMPLOYEE')
+        
+        # The post_save signal on User creates an EmployeeProfile automatically.
+        # Retrieve and update it with the provided validated_data, or create if not present.
+        profile = getattr(user, 'hrms_profile', None)
+        if profile:
+            for attr, value in validated_data.items():
+                setattr(profile, attr, value)
+            profile.save()
+        else:
+            profile = EmployeeProfile.objects.create(user=user, **validated_data)
+        
+        # Auto-create the salary structure for the new employee
+        from payroll.models import SalaryStructure
+        SalaryStructure.objects.get_or_create(employee=profile, defaults={'base_salary': profile.base_salary})
+        
+        return profile
+
+    def update(self, instance, validated_data):
+        user = instance.user
+        request = self.context.get('request')
+        is_admin = bool(
+            request and request.user and request.user.is_authenticated
+            and (request.user.role in ['SUPER_ADMIN', 'ADMIN'] or request.user.is_superuser)
+        )
+        
+        # If not admin, strip privileged fields
+        if not is_admin:
+            privileged_fields = [
+                'base_salary', 'designation', 'department', 'employee_id',
+                'employment_type', 'date_of_joining', 'reporting_to', 'status'
+            ]
+            for field in privileged_fields:
+                validated_data.pop(field, None)
+
+        # Extract user data
+        username = validated_data.pop('username', None)
+        email = validated_data.pop('email', None)
+        first_name = validated_data.pop('first_name', None)
+        last_name = validated_data.pop('last_name', None)
+        password = validated_data.pop('password', None)
+        
+        # Update user fields
+        if username and is_admin:
+            user.username = username
+        if email:
+            user.email = email
+        if first_name is not None:
+            user.first_name = first_name
+        if last_name is not None:
+            user.last_name = last_name
+        if password:
+            user.set_password(password)
+        user.save()
+        
+        # Update EmployeeProfile fields
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        
+        # Keep SalaryStructure in sync if base_salary was legitimately changed by admin
+        if is_admin and 'base_salary' in validated_data:
+            from payroll.models import SalaryStructure
+            salary_structure, created = SalaryStructure.objects.get_or_create(employee=instance)
+            salary_structure.base_salary = instance.base_salary
+            salary_structure.save()
+        
+        return instance
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret['username'] = instance.user.username
+        ret['email'] = instance.user.email
+        ret['first_name'] = instance.user.first_name
+        ret['last_name'] = instance.user.last_name
+        return ret
+
+class TaskCommentSerializer(serializers.ModelSerializer):
+    author_name = serializers.ReadOnlyField(source='author.get_full_name')
+    author_username = serializers.ReadOnlyField(source='author.username')
+
+    class Meta:
+        model = TaskComment
+        fields = ['id', 'task', 'author', 'author_name', 'author_username', 'content', 'created_at']
+        read_only_fields = ['author', 'created_at']
+
+class TaskSerializer(serializers.ModelSerializer):
+    assignee_name = serializers.ReadOnlyField(source='assignee.user.get_full_name')
+    assigned_by_name = serializers.ReadOnlyField(source='assigned_by.user.get_full_name')
+    comments = TaskCommentSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Task
+        fields = '__all__'
+
+class CompanyPostSerializer(serializers.ModelSerializer):
+    author_name = serializers.ReadOnlyField(source='author.get_full_name')
+    author_username = serializers.ReadOnlyField(source='author.username')
+    author_designation = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CompanyPost
+        fields = ['id', 'author', 'author_name', 'author_username', 'author_designation', 'content', 'post_type', 'created_at']
+        read_only_fields = ['author', 'created_at']
+
+    def get_author_designation(self, obj):
+        try:
+            return obj.author.hrms_profile.designation.name if obj.author.hrms_profile.designation else 'No Role'
+        except:
+            return 'No Role'
+
+class EmployeeDocumentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EmployeeDocument
+        fields = '__all__'
+
+    def validate_file(self, value):
+        if value:
+            return validate_employee_document_file(value)
+        return value
+
+class AssetSerializer(serializers.ModelSerializer):
+    assigned_to_name = serializers.ReadOnlyField(source='assigned_to.user.get_full_name')
+
+    class Meta:
+        model = Asset
+        fields = '__all__'
+
+class ExpenseSerializer(serializers.ModelSerializer):
+    employee_name = serializers.ReadOnlyField(source='employee.user.get_full_name')
+
+    class Meta:
+        model = Expense
+        fields = '__all__'
+
+    def validate_receipt(self, value):
+        if value:
+            return validate_receipt_file(value)
+        return value
+
+class PerformanceReviewSerializer(serializers.ModelSerializer):
+    employee_name = serializers.ReadOnlyField(source='employee.user.get_full_name')
+    reviewer_name = serializers.ReadOnlyField(source='reviewer.user.get_full_name')
+
+    class Meta:
+        model = PerformanceReview
+        fields = '__all__'
+
+class OffboardingSerializer(serializers.ModelSerializer):
+    employee_name = serializers.ReadOnlyField(source='employee.user.get_full_name')
+
+    class Meta:
+        model = Offboarding
+        fields = '__all__'
+
+from .models import FestiveGreeting, FestiveGreetingComment, CompanyPostComment
+
+class FestiveGreetingCommentSerializer(serializers.ModelSerializer):
+    author_name = serializers.ReadOnlyField(source='author.get_full_name')
+
+    class Meta:
+        model = FestiveGreetingComment
+        fields = ['id', 'greeting', 'author', 'author_name', 'content', 'created_at']
+        read_only_fields = ['author', 'created_at']
+
+class FestiveGreetingSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.ReadOnlyField(source='created_by.get_full_name')
+    comments = FestiveGreetingCommentSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = FestiveGreeting
+        fields = '__all__'
+        read_only_fields = ['created_by', 'created_at', 'updated_at']
+
+    def validate_banner_image(self, value):
+        if value:
+            return validate_profile_photo_file(value)
+        return value

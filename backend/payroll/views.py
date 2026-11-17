@@ -1,0 +1,354 @@
+import calendar
+from django.http import HttpResponse
+from decimal import Decimal
+from django.db.models import Q
+from django.utils import timezone
+from rest_framework import viewsets, permissions, status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from users.permissions import IsAdminOrSuperAdmin, IsAdminOrReadOnly
+from rest_framework.exceptions import PermissionDenied
+from hrms.models import EmployeeProfile, Attendance
+from .models import SalaryStructure, Payslip, BonusDeduction, EmployeeLoan, TaxDeclaration
+from .serializers import SalaryStructureSerializer, PayslipSerializer, BonusDeductionSerializer, EmployeeLoanSerializer, TaxDeclarationSerializer
+from .utils import render_to_pdf, number_to_words
+from .tax_calculator import calculate_monthly_tds
+
+class SalaryStructureViewSet(viewsets.ModelViewSet):
+    serializer_class = SalaryStructureSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        if not user.is_authenticated:
+            return SalaryStructure.objects.none()
+        if user.role in ['SUPER_ADMIN', 'ADMIN'] or user.is_superuser:
+            return SalaryStructure.objects.all()
+        return SalaryStructure.objects.filter(employee__user=user)
+
+    def get_permissions(self):
+        if self.action in ['create', 'update', 'partial_update', 'destroy']:
+            return [IsAdminOrSuperAdmin()]
+        return [permissions.IsAuthenticated()]
+
+class BonusDeductionViewSet(viewsets.ModelViewSet):
+    serializer_class = BonusDeductionSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        if not user.is_authenticated:
+            return BonusDeduction.objects.none()
+        if user.role in ['SUPER_ADMIN', 'ADMIN'] or user.is_superuser:
+            return BonusDeduction.objects.all()
+        return BonusDeduction.objects.filter(employee__user=user)
+
+    def get_permissions(self):
+        if self.action in ['create', 'update', 'partial_update', 'destroy']:
+            return [IsAdminOrSuperAdmin()]
+        return [permissions.IsAuthenticated()]
+
+class EmployeeLoanViewSet(viewsets.ModelViewSet):
+    queryset = EmployeeLoan.objects.all()
+    serializer_class = EmployeeLoanSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        if not user.is_authenticated:
+            return EmployeeLoan.objects.none()
+        if user.role in ['SUPER_ADMIN', 'ADMIN'] or user.is_superuser:
+            return EmployeeLoan.objects.all()
+        return EmployeeLoan.objects.filter(employee__user=user)
+
+    def get_permissions(self):
+        if self.action in ['update', 'partial_update', 'destroy']:
+            return [IsAdminOrSuperAdmin()]
+        return [permissions.IsAuthenticated()]
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        if not (user.role in ['SUPER_ADMIN', 'ADMIN'] or user.is_superuser):
+            try:
+                profile = user.hrms_profile
+            except Exception:
+                raise PermissionDenied("No employee profile found for this user.")
+            serializer.save(employee=profile, status='PENDING')
+        else:
+            serializer.save()
+
+class PayslipViewSet(viewsets.ModelViewSet):
+    serializer_class = PayslipSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        if not user.is_authenticated:
+            return Payslip.objects.none()
+        if user.role in ['SUPER_ADMIN', 'ADMIN'] or user.is_superuser:
+            return Payslip.objects.all()
+        return Payslip.objects.filter(employee__user=user)
+
+    def get_permissions(self):
+        if self.action in ['create', 'update', 'partial_update', 'destroy', 'generate_all', 'mark_paid']:
+            return [IsAdminOrSuperAdmin()]
+        return [permissions.IsAuthenticated()]
+
+    @action(detail=False, methods=['get'])
+    def summary(self, request):
+        qs = self.filter_queryset(self.get_queryset())
+
+        month = request.query_params.get('month')
+        year = request.query_params.get('year')
+        status_param = request.query_params.get('status')
+        if month:
+            qs = qs.filter(month=month)
+        if year:
+            qs = qs.filter(year=year)
+        if status_param:
+            qs = qs.filter(status=status_param)
+
+        from django.db.models import Sum, Avg
+
+        paid_qs = qs.filter(status='PAID')
+        total_disbursed = paid_qs.aggregate(total=Sum('net_salary'))['total'] or Decimal('0.00')
+        pending_slips = qs.filter(status='PENDING').count()
+        total_slips = qs.count()
+        paid_count = paid_qs.count()
+
+        avg_salary = paid_qs.aggregate(avg=Avg('net_salary'))['avg'] if paid_count > 0 else (qs.aggregate(avg=Avg('net_salary'))['avg'] or Decimal('0.00'))
+
+        return Response({
+            "total_disbursed": float(total_disbursed),
+            "pending_slips": pending_slips,
+            "total_slips": total_slips,
+            "paid_count": paid_count,
+            "avg_salary": float(avg_salary or 0),
+        })
+
+    @action(detail=False, methods=['post'])
+    def generate_all(self, request):
+        if not (request.user.role in ['SUPER_ADMIN', 'ADMIN'] or request.user.is_superuser):
+            return Response({"error": "Permission denied. Only HR/Admin can generate payslips."}, status=403)
+        month = int(request.data.get('month'))
+        year = int(request.data.get('year'))
+        
+        if not month or not year:
+            return Response({"error": "Month and Year are required"}, status=400)
+            
+        active_employees = EmployeeProfile.objects.filter(status='ACTIVE')
+        created_count = 0
+        skipped_count = 0
+        
+        _, days_in_month = calendar.monthrange(year, month)
+        
+        for emp in active_employees:
+            if Payslip.objects.filter(employee=emp, month=month, year=year).exists():
+                skipped_count += 1
+                continue
+                
+            try:
+                struct = emp.salary_structure
+            except SalaryStructure.DoesNotExist:
+                continue
+            
+            # --- PROFESSIONAL ATTENDANCE & LEAVE CALCULATION ---
+            # 1. Base Attendance
+            attendance = Attendance.objects.filter(
+                employee=emp, 
+                date__month=month, 
+                date__year=year
+            )
+            
+            present_days = attendance.filter(status__in=['PRESENT', 'LATE']).count()
+            half_days = attendance.filter(status='HALF_DAY').count()
+            paid_leave_days = attendance.filter(status='ON_LEAVE').count()
+            absent_records = attendance.filter(status='ABSENT')
+            
+            # 2. Smart Leave Override
+            from leaves.models import LeaveRequest
+            from django.db.models import Q
+            approved_leaves = LeaveRequest.objects.filter(
+                employee=emp, 
+                status='APPROVED'
+            ).filter(
+                Q(start_date__month=month, start_date__year=year) | 
+                Q(end_date__month=month, end_date__year=year)
+            )
+            
+            # If marked ABSENT but has an approved leave, forgive the absence
+            protected_absences = 0
+            for record in absent_records:
+                for leave in approved_leaves:
+                    if leave.start_date <= record.date <= leave.end_date:
+                        protected_absences += 1
+                        break
+            
+            real_absent_days = absent_records.count() - protected_absences
+            
+            # 3. Calculate LOP from explicitly Unpaid Leaves and count Paid Leaves
+            unpaid_leaves = approved_leaves.filter(leave_type__is_paid=False)
+            unpaid_leave_days = sum((l.end_date - l.start_date).days + 1 for l in unpaid_leaves)
+
+            paid_leaves = approved_leaves.filter(leave_type__is_paid=True)
+            approved_paid_leave_days = sum((l.end_date - l.start_date).days + 1 for l in paid_leaves)
+            actual_paid_leave_days = max(paid_leave_days, approved_paid_leave_days)
+            
+            # 4. Total LOP Calculation
+            lop_days = Decimal(str(real_absent_days)) + (Decimal(str(half_days)) * Decimal('0.5')) + Decimal(str(unpaid_leave_days))
+            
+            # Use Decimal for all money/day math
+            total_paid_days = Decimal(str(present_days)) + (Decimal(str(half_days)) * Decimal('0.5')) + Decimal(str(actual_paid_leave_days))
+            
+            gross_salary = struct.base_salary + struct.total_allowances
+            daily_rate = gross_salary / Decimal(str(days_in_month))
+            lop_deduction = (daily_rate * lop_days).quantize(Decimal('0.01'))
+            
+            # Calculate adjustments (Bonuses/Deductions)
+            adjustments = BonusDeduction.objects.filter(employee=emp, month=month, year=year, is_applied=False)
+            extra_allowances = sum(Decimal(str(adj.amount)) for adj in adjustments if adj.adjustment_type == 'BONUS')
+            if not isinstance(extra_allowances, Decimal): extra_allowances = Decimal('0')
+            
+            extra_deductions = sum(Decimal(str(adj.amount)) for adj in adjustments if adj.adjustment_type == 'DEDUCTION')
+            if not isinstance(extra_deductions, Decimal): extra_deductions = Decimal('0')
+            
+            # --- LOAN REPAYMENT LOGIC ---
+            loan_deduction = Decimal('0')
+            active_loans = EmployeeLoan.objects.filter(employee=emp, is_active=True, balance_amount__gt=0)
+            for loan in active_loans:
+                repayment = min(loan.monthly_repayment, loan.balance_amount)
+                loan_deduction += repayment
+                # We will update the balance ONLY when the payslip is generated
+                # But wait, what if generation is re-run?
+                # We should only update balance when status becomes PAID or at generation time?
+                # Professional ERPs update balance at GENERATION but allow reversal.
+                loan.balance_amount -= repayment
+                if loan.balance_amount <= 0:
+                    loan.is_active = False
+                loan.save()
+
+            # Create Payslip
+            total_allowances = struct.total_allowances + extra_allowances
+            
+            pf_deduction = struct.provident_fund
+            pt_deduction = struct.professional_tax
+            
+            # Estimate financial year
+            if month in [1, 2, 3]:
+                fy = f"{year-1}-{year}"
+            else:
+                fy = f"{year}-{year+1}"
+                
+            monthly_gross = struct.base_salary + total_allowances
+            tds_deduction = calculate_monthly_tds(emp, monthly_gross, financial_year=fy)
+            
+            total_deductions = pf_deduction + pt_deduction + tds_deduction + extra_deductions + lop_deduction + loan_deduction
+            net_salary = (struct.base_salary + total_allowances) - total_deductions
+            
+            Payslip.objects.create(
+                employee=emp,
+                month=month,
+                year=year,
+                basic_pay=struct.base_salary,
+                total_allowances=total_allowances,
+                provident_fund=pf_deduction,
+                professional_tax=pt_deduction,
+                tds_deduction=tds_deduction,
+                lop_deduction=lop_deduction,
+                loan_deduction=loan_deduction,
+                total_deductions=total_deductions,
+                net_salary=net_salary,
+                total_working_days=days_in_month,
+                paid_days=Decimal(str(days_in_month)) - lop_days,
+                status='PENDING'
+            )
+            
+            adjustments.update(is_applied=True)
+            created_count += 1
+            
+        return Response({
+            "message": f"Successfully generated {created_count} payslips. {skipped_count} already existed.",
+            "generated": created_count,
+            "skipped": skipped_count
+        })
+
+    @action(detail=True, methods=['post'])
+    def mark_as_paid(self, request, pk=None):
+        payslip = self.get_object()
+        payslip.status = 'PAID'
+        payslip.paid_on = timezone.now()
+        payslip.payment_method = request.data.get('payment_method', 'BANK_TRANSFER')
+        payslip.save()
+        return Response(PayslipSerializer(payslip).data)
+
+    @action(detail=True, methods=['get'])
+    def download_pdf(self, request, pk=None):
+        payslip = self.get_object()
+        
+        # Prepare context
+        month_name = calendar.month_name[payslip.month]
+        gross_salary = payslip.basic_pay + payslip.total_allowances
+        other_deductions = payslip.total_deductions - payslip.lop_deduction
+        
+        context = {
+            'payslip': payslip,
+            'employee': PayslipSerializer(payslip).data.get('employee_details', {}), # Assuming we have this in serializer
+            'month_name': month_name,
+            'year': payslip.year,
+            'gross_salary': gross_salary,
+            'other_deductions': other_deductions,
+            'net_in_words': number_to_words(payslip.net_salary),
+            'current_date': timezone.now().strftime('%d-%m-%Y %H:%M')
+        }
+        
+        # If employee details not in serializer, fetch manually
+        if not context['employee']:
+            from hrms.serializers import EmployeeProfileSerializer
+            context['employee'] = EmployeeProfileSerializer(payslip.employee).data
+
+        pdf = render_to_pdf('payroll/payslip.html', context)
+        if pdf:
+            filename = f"Payslip_{payslip.employee.employee_id}_{month_name}_{payslip.year}.pdf"
+            pdf['Content-Disposition'] = f'attachment; filename="{filename}"'
+            return pdf
+        return Response({"error": "PDF generation failed"}, status=400)
+
+class TaxDeclarationViewSet(viewsets.ModelViewSet):
+    serializer_class = TaxDeclarationSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get_queryset(self):
+        user = self.request.user
+        if user.role in ['SUPER_ADMIN', 'ADMIN'] or user.is_superuser:
+            return TaxDeclaration.objects.all()
+        # Ordinary employee can only see their own
+        try:
+            return TaxDeclaration.objects.filter(employee__user=user)
+        except Exception:
+            return TaxDeclaration.objects.none()
+        
+    def perform_create(self, serializer):
+        try:
+            profile = self.request.user.hrms_profile
+        except Exception:
+            raise serializers.ValidationError("No Employee Profile associated with this user.")
+        serializer.save(employee=profile, status='PENDING')
+        
+    @action(detail=True, methods=['post'])
+    def verify(self, request, pk=None):
+        user = request.user
+        if user.role not in ['SUPER_ADMIN', 'ADMIN'] and not user.is_superuser:
+            return Response({"error": "Unauthorized. Only admins can verify tax declarations."}, status=403)
+            
+        declaration = self.get_object()
+        new_status = request.data.get('status')
+        notes = request.data.get('notes', '')
+        
+        if new_status not in ['APPROVED', 'REJECTED']:
+            return Response({"error": "Invalid status. Must be APPROVED or REJECTED."}, status=400)
+            
+        declaration.status = new_status
+        declaration.notes = notes
+        declaration.save()
+        
+        return Response(TaxDeclarationSerializer(declaration).data)

@@ -1,0 +1,1124 @@
+import React, { useState, useEffect } from 'react';
+import { StyleSheet, TouchableOpacity, ScrollView, Alert, ActivityIndicator, Image, Modal, Button, Text, View, TextInput } from 'react-native';
+import * as Location from 'expo-location';
+import * as ImagePicker from 'expo-image-picker';
+import * as FileSystem from 'expo-file-system';
+import { CameraView, useCameraPermissions, CameraType } from 'expo-camera';
+import * as ImageManipulator from 'expo-image-manipulator';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { FontAwesome5 } from '@expo/vector-icons';
+import { clockIn, clockOut, getAttendanceStatus } from '../../src/api/attendance';
+import client from '../../src/api/client';
+import Colors from '@/constants/Colors';
+import { syncMissingRecordings } from '../../src/utils/SyncManager';
+
+import { useRouter, useFocusEffect } from 'expo-router';
+import { useCallback } from 'react';
+
+export default function AttendanceScreen() {
+  const router = useRouter();
+
+
+  const [loading, setLoading] = useState(true);
+  const [isClockedIn, setIsClockedIn] = useState(false);
+  const [attendance, setAttendance] = useState<any>(null);
+  const [location, setLocation] = useState<any>(null);
+  const [currentTime, setCurrentTime] = useState(new Date());
+  const [stats, setStats] = useState<any>(null);
+  const [tasks, setTasks] = useState<any[]>([]);
+  const [user, setUser] = useState<any>(null);
+  const [festiveGreeting, setFestiveGreeting] = useState<any>(null);
+  const [mobileWishInput, setMobileWishInput] = useState('');
+  const [showWishesModal, setShowWishesModal] = useState(false);
+
+  const [showCamera, setShowCamera] = useState(false);
+  const [facing, setFacing] = useState<CameraType>('front');
+  const [permission, requestPermission] = useCameraPermissions();
+  const cameraRef = React.useRef<CameraView>(null);
+
+  // Update clock every second
+  useEffect(() => {
+    const timer = setInterval(() => setCurrentTime(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  useFocusEffect(
+    useCallback(() => {
+      loadUser();
+      fetchStatus();
+      fetchStats();
+      requestLocationPermission();
+      syncMissingRecordings();
+    }, [])
+  );
+
+  const loadUser = async () => {
+    try {
+      const token = await AsyncStorage.getItem('userToken');
+      if (!token || !token.trim()) {
+        await AsyncStorage.multiRemove(['userToken', 'userInfo']);
+        router.replace('/login');
+        return;
+      }
+
+      const cached = await AsyncStorage.getItem('userInfo');
+      if (cached) {
+        try {
+          const parsed = JSON.parse(cached);
+          if (parsed && (parsed.role || parsed.username)) {
+            setUser(parsed);
+          }
+        } catch (parseErr) {
+          console.warn('[Dashboard] Failed to parse cached userInfo:', parseErr);
+        }
+      }
+
+      const res = await client.get('/auth/me/');
+      if (res.data && res.data.role && (res.data.username || res.data.id)) {
+        setUser(res.data);
+        await AsyncStorage.setItem('userInfo', JSON.stringify(res.data));
+      }
+    } catch (err) {
+      console.log('[Dashboard] Failed to refresh user details from API, keeping cached state:', err);
+    }
+  };
+
+  const requestLocationPermission = async () => {
+    let { status } = await Location.requestForegroundPermissionsAsync();
+    if (status !== 'granted') {
+      Alert.alert('Permission Denied', 'We need location access to verify your attendance.');
+      return;
+    }
+    let loc = await Location.getCurrentPositionAsync({});
+    setLocation(loc);
+  };
+
+  // If the app reloaded in the middle of a clock-in (e.g. camera dismissed app on Android),
+
+
+  const fetchStats = async () => {
+    try {
+      const token = await AsyncStorage.getItem('userToken');
+      if (!token) return;
+
+      const res = await client.get('/dashboard-stats/');
+      if (res.data) {
+        setStats(res.data);
+      }
+      
+      // Fetch only MY pending tasks (assigned to me, regardless of due date so overdue tasks aren't hidden)
+      const tasksRes = await client.get('/crm/tasks/', {
+        params: {
+          status: 'PENDING',
+          assigned_to_me: 'true',
+          ordering: 'due_date',      // soonest first
+        }
+      });
+      const tasksData = tasksRes.data?.results || tasksRes.data || [];
+      setTasks(tasksData.slice(0, 10)); // show up to 10
+
+      // Fetch active festive greeting
+      try {
+        const greetingRes = await client.get('/hrms/festive-greetings/active/');
+        const list = Array.isArray(greetingRes.data) ? greetingRes.data : (greetingRes.data?.results || []);
+        if (list.length > 0) {
+          setFestiveGreeting(list[0]);
+        }
+      } catch (gErr) {
+        console.log('No active festive greeting:', gErr);
+      }
+    } catch (e) {
+      console.log('Failed to fetch dashboard stats', e);
+    }
+  };
+
+  const completeTask = async (taskId: string) => {
+    try {
+      await client.patch(`/crm/tasks/${taskId}/`, { status: 'COMPLETED' });
+      fetchStats(); // refresh tasks list
+    } catch (e) {
+      console.log('Failed to complete task', e);
+      Alert.alert('Error', 'Failed to mark task as complete.');
+    }
+  };
+
+
+  const getLocalDateString = () => {
+    const d = new Date();
+    const offset = d.getTimezoneOffset();
+    const localDate = new Date(d.getTime() - (offset * 60 * 1000));
+    return localDate.toISOString().split('T')[0];
+  };
+
+  const fetchStatus = async () => {
+    setLoading(true);
+    try {
+      // Guard: skip if not authenticated yet
+      const token = await AsyncStorage.getItem('userToken');
+      if (!token) {
+        setIsClockedIn(false);
+        setAttendance(null);
+        setLoading(false);
+        return;
+      }
+
+      const today = getLocalDateString();
+      const data = await getAttendanceStatus(today);
+      if (data) {
+        const records = data.results || data || [];
+        // Only look at TODAY's records — filter by date to avoid stale previous days
+        const activeRecord = records.find((r: any) => r.date === today && r.clock_in && !r.clock_out);
+        
+        if (activeRecord) {
+          setIsClockedIn(true);
+          setAttendance(activeRecord);
+        } else {
+          setIsClockedIn(false);
+          setAttendance(null);
+        }
+      } else {
+        setIsClockedIn(false);
+        setAttendance(null);
+      }
+    } catch (err) {
+      console.error('fetchStatus failed:', err);
+      setIsClockedIn(false);
+      setAttendance(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+
+  const handleAttendance = async () => {
+    setLoading(true);
+    try {
+      if (isClockedIn) {
+        const res = await clockOut();
+        if (res.success) {
+          Alert.alert('Success', 'Clocked out successfully!');
+          await fetchStatus();
+        } else {
+          Alert.alert('Error', res.error);
+        }
+      } else {
+        if (!permission?.granted) {
+            const perm = await requestPermission();
+            if (!perm.granted) {
+                Alert.alert('Permission Denied', 'We need camera access to verify your identity for clock-in.');
+                return;
+            }
+        }
+        setShowCamera(true);
+      }
+    } catch (error: any) {
+      console.error('Attendance execution error:', error);
+      Alert.alert('Error', error.message || 'An unexpected error occurred during attendance check.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const processClockIn = async (base64RawData: string) => {
+    setShowCamera(false);
+    setLoading(true);
+    try {
+        const base64Photo = `data:image/jpeg;base64,${base64RawData}`;
+
+        let loc;
+        try {
+          const locServicesEnabled = await Location.hasServicesEnabledAsync();
+          if (!locServicesEnabled) {
+            throw new Error('Location services are disabled on your device. Please enable GPS.');
+          }
+          
+          const { status } = await Location.getForegroundPermissionsAsync();
+          if (status !== 'granted') {
+            throw new Error('Location permissions have not been granted. Please enable location access in settings.');
+          }
+
+          loc = await Location.getCurrentPositionAsync({
+            accuracy: Location.Accuracy.Balanced,
+          });
+        } catch (locErr: any) {
+          console.warn('getCurrentPositionAsync failed, trying getLastKnownPositionAsync:', locErr);
+          loc = await Location.getLastKnownPositionAsync({});
+          if (!loc) {
+            throw new Error(locErr.message || 'Could not retrieve your current GPS coordinates. Please ensure GPS is enabled and has signal.');
+          }
+        }
+
+        const res = await clockIn(loc.coords.latitude, loc.coords.longitude, base64Photo);
+        
+        if (res.success) {
+          Alert.alert('Success', 'Clocked in successfully!');
+          await fetchStatus();
+        } else {
+          if (res.error !== 'Session expired. Please log in again.') {
+            Alert.alert('Error', res.error);
+          }
+        }
+    } catch (error: any) {
+      console.error('Clock in error:', error);
+      Alert.alert('Error', error.message || 'An unexpected error occurred during clock-in.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const getGreeting = () => {
+    const hours = currentTime.getHours();
+    if (hours < 12) return 'Good Morning';
+    if (hours < 18) return 'Good Afternoon';
+    return 'Good Evening';
+  };
+
+  if (loading && !attendance && !user) {
+    return (
+      <View style={[styles.loadingContainer, { backgroundColor: '#FFFFFF' }]}>
+        <ActivityIndicator size="large" color="#FBBF24" />
+      </View>
+    );
+  }
+const welcomeName = user ? `${user.first_name || user.username}` : 'Member';
+  const roleName = user ? `${user.role || 'Staff'}`.replace('_', ' ') : 'MEMBER';
+
+  const handleSendMobileWish = async () => {
+    if (!mobileWishInput.trim() || !festiveGreeting) return;
+    try {
+      const res = await client.post('/hrms/festive-greeting-comments/', {
+        greeting: festiveGreeting.id,
+        content: mobileWishInput
+      });
+      setFestiveGreeting((prev: any) => ({
+        ...prev,
+        comments: [...(prev?.comments || []), res.data]
+      }));
+      setMobileWishInput('');
+      Alert.alert('Wish Posted! 🎉', 'Your wish has been posted live to the team thread.');
+    } catch (err) {
+      console.log('Failed to post wish:', err);
+    }
+  };
+
+  const getFestiveBadgeText = (theme?: string) => {
+    switch (theme) {
+      case 'ONAM': return 'ONAM FESTIVAL';
+      case 'DIWALI': return 'DIWALI FESTIVAL';
+      case 'NEW_YEAR': return 'NEW YEAR CELEBRATION';
+      case 'CHRISTMAS': return 'CHRISTMAS GREETINGS';
+      case 'EID': return 'EID MUBARAK';
+      case 'BIRTHDAY': return 'BIRTHDAY WISH';
+      case 'HOLI': return 'HOLI FESTIVAL';
+      case 'COMPANY_MILESTONE': return 'COMPANY MILESTONE';
+      default: return 'HR ANNOUNCEMENT & ALERT';
+    }
+  };
+
+  return (
+    <>
+    <ScrollView 
+      style={[styles.container, { backgroundColor: '#FFFFFF' }]} 
+      contentContainerStyle={styles.content}
+      showsVerticalScrollIndicator={false}
+    >
+      {/* Welcome Bar */}
+      <View style={[styles.welcomeBar]}>
+        <View style={{ backgroundColor: 'transparent' }}>
+          <Text style={[styles.greetingText, { color: '#6B7280' }]}>
+            {getGreeting()},
+          </Text>
+          <Text style={[styles.nameText, { color: '#111827' }]}>
+            {welcomeName}
+          </Text>
+        </View>
+        <View style={styles.roleBadge}>
+          <Text style={styles.roleBadgeText}>{roleName}</Text>
+        </View>
+      </View>
+      {/* Festive Greeting Banner Card (Ultra-Premium Redesign) */}
+      {festiveGreeting && (
+        <View style={{
+          borderRadius: 24,
+          overflow: 'hidden',
+          marginBottom: 20,
+          backgroundColor: '#1E1B4B',
+          elevation: 6,
+          shadowColor: '#4338CA',
+          shadowOffset: { width: 0, height: 8 },
+          shadowOpacity: 0.25,
+          shadowRadius: 16,
+        }}>
+          {festiveGreeting.banner_image ? (
+            <Image source={{ uri: festiveGreeting.banner_image }} style={{ width: '100%', height: 180 }} resizeMode="cover" />
+          ) : null}
+          
+          <View style={{ padding: 18, backgroundColor: festiveGreeting.banner_image ? '#1E1B4B' : 'transparent' }}>
+            {/* Top Pill Bar */}
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+              <View style={{
+                flexDirection: 'row',
+                alignItems: 'center',
+                backgroundColor: 'rgba(255, 255, 255, 0.15)',
+                paddingHorizontal: 10,
+                paddingVertical: 4,
+                borderRadius: 20,
+                gap: 6,
+                borderWidth: 1,
+                borderColor: 'rgba(255, 255, 255, 0.25)'
+              }}>
+                <FontAwesome5 name={festiveGreeting.theme === 'CUSTOM' ? "bullhorn" : "star"} size={10} color="#FBBF24" />
+                <Text style={{ fontSize: 10, fontWeight: '900', color: '#FDE68A', letterSpacing: 0.5 }}>
+                  {getFestiveBadgeText(festiveGreeting.theme)}
+                </Text>
+              </View>
+
+              {festiveGreeting.comments && festiveGreeting.comments.length > 0 && (
+                <TouchableOpacity
+                  onPress={() => setShowWishesModal(true)}
+                  style={{
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    backgroundColor: 'rgba(251, 191, 36, 0.2)',
+                    paddingHorizontal: 10,
+                    paddingVertical: 4,
+                    borderRadius: 20,
+                    gap: 5,
+                    borderWidth: 1,
+                    borderColor: 'rgba(251, 191, 36, 0.4)'
+                  }}
+                >
+                  <FontAwesome5 name="comments" size={10} color="#FBBF24" />
+                  <Text style={{ fontSize: 10, fontWeight: '900', color: '#FDE68A' }}>
+                    {festiveGreeting.comments.length} Wishes
+                  </Text>
+                </TouchableOpacity>
+              )}
+            </View>
+
+            {/* Title & Body */}
+            <Text style={{ fontSize: 20, fontWeight: '900', color: '#FFFFFF', marginBottom: 4, letterSpacing: -0.3 }}>
+              {festiveGreeting.title}
+            </Text>
+
+            {festiveGreeting.sub_title ? (
+              <Text style={{ fontSize: 13, fontWeight: '700', color: '#FCD34D', marginBottom: 8 }}>
+                {festiveGreeting.sub_title}
+              </Text>
+            ) : null}
+
+            <Text style={{ fontSize: 13, color: 'rgba(255, 255, 255, 0.9)', lineHeight: 20, fontStyle: 'italic', marginBottom: 14 }}>
+              "{festiveGreeting.message}"
+            </Text>
+
+            {/* Action Row */}
+            <View style={{ flexDirection: 'row', gap: 10, alignItems: 'center' }}>
+              <TouchableOpacity
+                onPress={() => setShowWishesModal(true)}
+                style={{
+                  flex: 1,
+                  backgroundColor: '#F59E0B',
+                  borderRadius: 14,
+                  paddingVertical: 12,
+                  alignItems: 'center',
+                  flexDirection: 'row',
+                  justifyContent: 'center',
+                  gap: 6,
+                  shadowColor: '#F59E0B',
+                  shadowOffset: { width: 0, height: 4 },
+                  shadowOpacity: 0.3,
+                  shadowRadius: 8,
+                  elevation: 3
+                }}
+              >
+                <FontAwesome5 name="heart" size={12} color="#FFF" solid />
+                <Text style={{ color: '#FFF', fontWeight: '900', fontSize: 13 }}>
+                  Wish & View Thread 🎉
+                </Text>
+              </TouchableOpacity>
+
+              {festiveGreeting.comments && festiveGreeting.comments.length > 0 && (
+                <TouchableOpacity
+                  onPress={() => setShowWishesModal(true)}
+                  style={{
+                    width: 44,
+                    height: 44,
+                    borderRadius: 14,
+                    backgroundColor: 'rgba(255,255,255,0.12)',
+                    justifyContent: 'center',
+                    alignItems: 'center',
+                    borderWidth: 1,
+                    borderColor: 'rgba(255,255,255,0.2)'
+                  }}
+                >
+                  <FontAwesome5 name="comments" size={16} color="#FBBF24" />
+                </TouchableOpacity>
+              )}
+            </View>
+          </View>
+        </View>
+      )}
+
+      {/* Ultra-Premium Full Wishes Bottom Sheet Modal */}
+      <Modal
+        visible={showWishesModal}
+        animationType="slide"
+        transparent={true}
+        onRequestClose={() => setShowWishesModal(false)}
+      >
+        <View style={{ flex: 1, backgroundColor: 'rgba(15, 23, 42, 0.75)', justifyContent: 'flex-end' }}>
+          <View style={{ backgroundColor: '#FFFFFF', borderTopLeftRadius: 32, borderTopRightRadius: 32, height: '80%', padding: 22 }}>
+            {/* Modal Drag Bar */}
+            <View style={{ width: 40, height: 4, borderRadius: 2, backgroundColor: '#E2E8F0', alignSelf: 'center', marginBottom: 16 }} />
+
+            {/* Modal Header */}
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18, paddingBottom: 14, borderBottomWidth: 1, borderColor: '#F1F5F9' }}>
+              <View>
+                <Text style={{ fontSize: 20, fontWeight: '900', color: '#0F172A', letterSpacing: -0.3 }}>
+                  Team Celebration Thread 🎂
+                </Text>
+                <Text style={{ fontSize: 12, color: '#64748B', fontWeight: '600', marginTop: 2 }}>
+                  {festiveGreeting?.comments?.length || 0} messages from colleagues
+                </Text>
+              </View>
+              <TouchableOpacity
+                onPress={() => setShowWishesModal(false)}
+                style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: '#F1F5F9', justifyContent: 'center', alignItems: 'center' }}
+              >
+                <Text style={{ fontSize: 16, fontWeight: '900', color: '#64748B' }}>✕</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Scrollable Wishes Feed */}
+            <ScrollView style={{ flex: 1 }} showsVerticalScrollIndicator={false}>
+              {(!festiveGreeting?.comments || festiveGreeting.comments.length === 0) ? (
+                <View style={{ padding: 40, alignItems: 'center' }}>
+                  <Text style={{ fontSize: 14, color: '#94A3B8', fontStyle: 'italic', fontWeight: '500' }}>
+                    No wishes posted yet. Be the first to wish them!
+                  </Text>
+                </View>
+              ) : (
+                festiveGreeting.comments.map((c: any, idx: number) => {
+                  const initial = (c.author_name || 'U').charAt(0).toUpperCase();
+                  const avatarColors = ['#F59E0B', '#6366F1', '#EC4899', '#10B981', '#8B5CF6'];
+                  const color = avatarColors[idx % avatarColors.length];
+
+                  return (
+                    <View key={c.id || idx} style={{ flexDirection: 'row', gap: 12, marginBottom: 14, backgroundColor: '#F8FAFC', padding: 14, borderRadius: 20, borderWidth: 1, borderColor: '#F1F5F9' }}>
+                      <View style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: color, justifyContent: 'center', alignItems: 'center', shadowColor: color, shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.3, shadowRadius: 4 }}>
+                        <Text style={{ color: '#FFF', fontWeight: '900', fontSize: 15 }}>{initial}</Text>
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                          <Text style={{ fontSize: 13, fontWeight: '800', color: '#0F172A' }}>{c.author_name || 'Team Member'}</Text>
+                          <Text style={{ fontSize: 11, color: '#94A3B8', fontWeight: '600' }}>
+                            {new Date(c.created_at || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </Text>
+                        </View>
+                        <Text style={{ fontSize: 13, color: '#334155', lineHeight: 20, fontWeight: '500' }}>{c.content}</Text>
+                      </View>
+                    </View>
+                  );
+                })
+              )}
+            </ScrollView>
+
+            {/* Bottom Modal Input Bar */}
+            <View style={{ paddingTop: 14, borderTopWidth: 1, borderColor: '#F1F5F9', flexDirection: 'row', gap: 10, alignItems: 'center' }}>
+              <TextInput
+                style={{
+                  flex: 1,
+                  backgroundColor: '#F8FAFC',
+                  borderRadius: 16,
+                  paddingHorizontal: 16,
+                  paddingVertical: 12,
+                  fontSize: 13,
+                  borderWidth: 1,
+                  borderColor: '#E2E8F0',
+                  color: '#0F172A',
+                  fontWeight: '500'
+                }}
+                placeholder="Type your birthday wish..."
+                placeholderTextColor="#94A3B8"
+                value={mobileWishInput}
+                onChangeText={setMobileWishInput}
+              />
+              <TouchableOpacity
+                onPress={handleSendMobileWish}
+                style={{
+                  backgroundColor: '#F59E0B',
+                  paddingHorizontal: 18,
+                  paddingVertical: 12,
+                  borderRadius: 16,
+                  shadowColor: '#F59E0B',
+                  shadowOffset: { width: 0, height: 4 },
+                  shadowOpacity: 0.3,
+                  shadowRadius: 8,
+                  elevation: 3
+                }}
+              >
+                <Text style={{ color: '#FFF', fontWeight: '900', fontSize: 13 }}>Send 🎂</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Hero Header Clock Card */}
+      <View style={styles.heroCard}>
+        <Text style={styles.heroTitle}>PORTAL HUB</Text>
+        <Text style={styles.clockText}>
+          {currentTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+        </Text>
+        <Text style={styles.dateText}>
+          {currentTime.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' })}
+        </Text>
+
+        <TouchableOpacity 
+          style={[styles.clockButton, isClockedIn ? styles.buttonOut : styles.buttonIn]}
+          onPress={handleAttendance}
+          disabled={loading}
+          activeOpacity={0.8}
+        >
+          {loading ? (
+            <ActivityIndicator color="#FFF" />
+          ) : (
+            <>
+              <FontAwesome5 
+                name={isClockedIn ? "sign-out-alt" : "fingerprint"} 
+                size={20} 
+                color={isClockedIn ? "#FFFFFF" : "#FFB800"} 
+              />
+              <Text style={[styles.buttonText, { color: isClockedIn ? "#FFFFFF" : "#FFB800" }]}>
+                {isClockedIn ? "Clock Out Now" : "Scan Fingerprint / Clock In"}
+              </Text>
+            </>
+          )}
+        </TouchableOpacity>
+      </View>
+
+      {/* Status Section */}
+      <View style={[styles.section]}>
+        <Text style={[styles.sectionTitle, { color: '#4B5563' }]}>ATTENDANCE REGISTRY</Text>
+        <View style={[styles.statusCard, { backgroundColor: '#FFFFFF', borderColor: '#E5E7EB' }]}>
+          <View style={styles.statusRow}>
+            <FontAwesome5 name="map-marker-alt" size={16} color={location ? '#10B981' : '#EF4444'} />
+            <Text style={[styles.statusLabel, { color: '#374151' }]}>Geofencing Lock</Text>
+            <Text style={[styles.statusValue, { color: location ? '#10B981' : '#EF4444' }]}>
+              {location ? 'Locked In' : 'Acquiring GPS...'}
+            </Text>
+          </View>
+          
+          {isClockedIn && (
+            <View style={[styles.statusRow, { borderTopWidth: 1, borderTopColor: '#F3F4F6', marginTop: 12, paddingTop: 12 }]}>
+              <FontAwesome5 name="clock" size={16} color="#FFB800" />
+              <Text style={[styles.statusLabel, { color: '#374151' }]}>Shift Clock In</Text>
+              <Text style={[styles.statusValue, { color: '#111827' }]}>
+                {attendance?.clock_in && attendance?.date
+                  ? (() => {
+                      const timePart = (attendance.clock_in || '').split('.')[0];
+                      const dt = new Date(`${attendance.date}T${timePart}`);
+                      return dt.toLocaleString('en-IN', {
+                        day: 'numeric', month: 'short',
+                        hour: '2-digit', minute: '2-digit', hour12: true
+                      });
+                    })()
+                  : 'Not clocked in'}
+              </Text>
+            </View>
+          )}
+        </View>
+      </View>
+
+      {/* Dashboard Stats Section */}
+      {['SUPER_ADMIN', 'ACADEMIC_DIRECTOR', 'COORDINATOR'].includes(user?.role) && (
+      <View style={[styles.section]}>
+        <Text style={[styles.sectionTitle, { color: '#4B5563' }]}>ACADEMY QUICK LOOK</Text>
+        <View style={styles.statsGrid}>
+          <TouchableOpacity 
+            style={[styles.statCard, { backgroundColor: '#FFFFFF', borderColor: '#E5E7EB' }]}
+            onPress={() => router.push('/module?title=Academic Hierarchy&category=Academics' as any)}
+            activeOpacity={0.8}
+          >
+            <View style={styles.statHeader}>
+              <FontAwesome5 name="graduation-cap" size={16} color="#FFB800" />
+              <Text style={[styles.statBadge, { color: '#FFB800', backgroundColor: 'rgba(234, 179, 8, 0.15)' }]}>Live</Text>
+            </View>
+            <Text style={[styles.statNumber, { color: '#111827' }]}>{stats?.students ?? '0'}</Text>
+            <Text style={[styles.statName, { color: '#6B7280' }]}>Students</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity 
+            style={[styles.statCard, { backgroundColor: '#FFFFFF', borderColor: '#E5E7EB' }]}
+            onPress={() => router.push('/module?title=Mentor Module&category=Academics' as any)}
+            activeOpacity={0.8}
+          >
+            <View style={styles.statHeader}>
+              <FontAwesome5 name="university" size={16} color="#D97706" />
+              <Text style={[styles.statBadge, { color: '#D97706', backgroundColor: 'rgba(217, 119, 6, 0.15)' }]}>Active</Text>
+            </View>
+            <Text style={[styles.statNumber, { color: '#111827' }]}>{stats?.batches ?? '0'}</Text>
+            <Text style={[styles.statName, { color: '#6B7280' }]}>Batches</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity 
+            style={[styles.statCard, { backgroundColor: '#FFFFFF', borderColor: '#E5E7EB' }]}
+            onPress={() => router.push('/(tabs)/two' as any)}
+            activeOpacity={0.8}
+          >
+            <View style={styles.statHeader}>
+              <FontAwesome5 name="user-friends" size={16} color="#F59E0B" />
+              <Text style={[styles.statBadge, { color: '#F59E0B', backgroundColor: 'rgba(245, 158, 11, 0.15)' }]}>Pipeline</Text>
+            </View>
+            <Text style={[styles.statNumber, { color: '#111827' }]}>{stats?.leads ?? '0'}</Text>
+            <Text style={[styles.statName, { color: '#6B7280' }]}>Leads</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity 
+            style={[styles.statCard, { backgroundColor: '#FFFFFF', borderColor: '#E5E7EB' }]}
+            onPress={() => router.push('/module?title=Finance Manager&category=Administrative' as any)}
+            activeOpacity={0.8}
+          >
+            <View style={styles.statHeader}>
+              <FontAwesome5 name="wallet" size={16} color="#10B981" />
+              <Text style={[styles.statBadge, { color: '#10B981', backgroundColor: 'rgba(16, 185, 129, 0.15)' }]}>INR</Text>
+            </View>
+            <Text style={[styles.statNumber, { color: '#111827' }]}>
+              ₹{stats?.expenses ? Math.round(stats.expenses).toLocaleString('en-IN') : '0'}
+            </Text>
+            <Text style={[styles.statName, { color: '#6B7280' }]}>Expenses</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+      )}
+
+      {/* Sales CRM Hub Section */}
+      {(['SALES', 'SALES_HEAD', 'SALES_MANAGER', 'MANAGER', 'SALES_LEAD', 'SUPER_ADMIN', 'ADMIN'].includes(user?.role)) && (
+        <View style={[styles.section]}>
+          <View style={{flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12}}>
+            <Text style={[styles.sectionTitle, { color: '#4B5563', marginBottom: 0 }]}>SALES CRM HUB</Text>
+            
+            {(['SUPER_ADMIN', 'ADMIN', 'SALES_HEAD', 'SALES_MANAGER', 'MANAGER', 'SALES_LEAD'].includes(user?.role) || user?.is_manager) ? (
+              <TouchableOpacity onPress={() => router.push('/team-report' as any)}>
+                 <Text style={{color: '#FFB800', fontSize: 12, fontWeight: '800'}}>TEAM REPORT &gt;</Text>
+              </TouchableOpacity>
+            ) : (
+              <TouchableOpacity onPress={() => router.push(`/bde-report?bdeId=${user.id}` as any)}>
+                 <Text style={{color: '#FFB800', fontSize: 12, fontWeight: '800'}}>MY FULL REPORT &gt;</Text>
+              </TouchableOpacity>
+            )}
+
+          </View>
+          
+          <View style={[styles.tasksCard, { backgroundColor: '#FFFFFF', borderColor: '#E5E7EB' }]}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+              <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                <FontAwesome5 name="calendar-check" size={14} color="#FFB800" style={{ marginRight: 8 }} />
+                <Text style={[styles.tasksHeader, { color: '#374151', marginBottom: 0 }]}>
+                  My Upcoming Follow-ups
+                </Text>
+              </View>
+              <TouchableOpacity onPress={() => router.push('/all-tasks' as any)}>
+                <Text style={{ color: '#F59E0B', fontSize: 11, fontWeight: '800' }}>VIEW ALL &gt;</Text>
+              </TouchableOpacity>
+            </View>
+             {tasks.length > 0 ? tasks.map(task => (
+                <TouchableOpacity key={task.id} style={[styles.taskItem, { borderTopColor: '#F3F4F6' }]} onPress={() => { if (task.student) router.push(`/lead-details?leadId=${task.student}` as any); }}>
+                   <View style={{flex: 1}}>
+                      <Text style={[styles.taskTitle, { color: '#111827' }]} numberOfLines={1}>{task.title}</Text>
+                      {(task.notes || task.description) ? (
+                        <Text style={{ fontSize: 11, color: '#6B7280', marginTop: 2 }} numberOfLines={1}>{task.notes || task.description}</Text>
+                      ) : null}
+                      <Text style={styles.taskDate}>
+                        <FontAwesome5 name="clock" size={10} color="#F59E0B" /> {task.due_date ? new Date(task.due_date).toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute:'2-digit'}) : 'No due date'}
+                      </Text>
+                   </View>
+                   <TouchableOpacity style={{ padding: 10, marginRight: -5, marginLeft: 10 }} onPress={() => completeTask(task.id)}>
+                      <FontAwesome5 name="check-circle" size={22} color="#10B981" />
+                   </TouchableOpacity>
+                </TouchableOpacity>
+             )) : (
+                <View style={{ alignItems: 'center', paddingVertical: 16 }}>
+                  <FontAwesome5 name="check-circle" size={24} color="#10B981" style={{ marginBottom: 8, opacity: 0.8 }} />
+                  <Text style={[styles.emptyTaskText, { color: '#6B7280' }]}>No upcoming follow-ups today</Text>
+                </View>
+             )}
+          </View>
+        </View>
+      )}
+
+
+      {/* Geofence Alert Info */}
+      <View style={[styles.infoCard, { backgroundColor: '#FEF3C7', borderColor: '#FDE68A' }]}>
+        <FontAwesome5 name="info-circle" size={18} color="#FFB800" />
+        <Text style={[styles.infoText, { color: '#92400E' }]}>
+          Secure Face Recognition & Geofenced boundary validation is enabled. Please log in when physically inside the facility premises.
+        </Text>
+      </View>
+    </ScrollView>
+
+    <Modal visible={showCamera} animationType="slide" transparent={false}>
+        <View style={styles.cameraContainer}>
+            <CameraView 
+                style={styles.camera} 
+                facing={facing} 
+                ref={cameraRef}
+                mode="picture"
+            />
+            <View style={styles.cameraControls}>
+                <TouchableOpacity style={styles.cameraButton} onPress={() => setFacing(current => (current === 'back' ? 'front' : 'back'))}>
+                    <FontAwesome5 name="sync" size={24} color="white" />
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.cameraCaptureButton} onPress={async () => {
+                    if (cameraRef.current) {
+                        try {
+                            const photo = await cameraRef.current.takePictureAsync({
+                                quality: 0.1,
+                                base64: false,
+                            });
+                            if (photo?.uri) {
+                                const manipResult = await ImageManipulator.manipulateAsync(
+                                    photo.uri,
+                                    [{ resize: { width: 800 } }],
+                                    { compress: 0.5, format: ImageManipulator.SaveFormat.JPEG, base64: true }
+                                );
+                                if (manipResult.base64) {
+                                    processClockIn(manipResult.base64);
+                                }
+                            }
+                        } catch (e) {
+                            console.warn('Camera capture failed', e);
+                            Alert.alert('Error', 'Failed to capture photo.');
+                            setShowCamera(false);
+                        }
+                    }
+                }}>
+                    <View style={styles.cameraCaptureInner} />
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.cameraButton} onPress={() => setShowCamera(false)}>
+                    <FontAwesome5 name="times" size={24} color="white" />
+                </TouchableOpacity>
+            </View>
+        </View>
+    </Modal>
+    </>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+  },
+  content: {
+    padding: 20,
+    paddingTop: 45,
+  },
+  loadingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  welcomeBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 20,
+    paddingHorizontal: 4,
+  },
+  greetingText: {
+    fontSize: 14,
+    fontWeight: '700',
+    letterSpacing: 0.5,
+  },
+  nameText: {
+    fontSize: 26,
+    fontWeight: '900',
+    marginTop: 2,
+  },
+  roleBadge: {
+    backgroundColor: '#FFB800',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 12,
+    alignSelf: 'center',
+  },
+  roleBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: '900',
+    letterSpacing: 1.5,
+    textTransform: 'uppercase',
+  },
+  heroCard: {
+    backgroundColor: '#FFB800', // Natya Yellow
+    borderRadius: 24,
+    padding: 24,
+    alignItems: 'center',
+    shadowColor: '#FFB800',
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.35,
+    shadowRadius: 15,
+    elevation: 8,
+    marginBottom: 24,
+  },
+  heroTitle: {
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: '900',
+    letterSpacing: 2.5,
+    marginBottom: 8,
+  },
+  clockText: {
+    color: '#FFFFFF',
+    fontSize: 40,
+    fontWeight: '900',
+    letterSpacing: 1,
+    marginBottom: 4,
+  },
+  dateText: {
+    color: '#FEF3C7',
+    fontSize: 13,
+    fontWeight: '700',
+    marginBottom: 20,
+  },
+  clockButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 14,
+    paddingHorizontal: 28,
+    borderRadius: 16,
+    width: '100%',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.15,
+    shadowRadius: 6,
+    elevation: 4,
+  },
+  buttonIn: {
+    backgroundColor: '#FFFFFF', // White
+  },
+  buttonOut: {
+    backgroundColor: '#EF4444', // Crimson red
+  },
+  buttonText: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '900',
+    marginLeft: 10,
+    letterSpacing: 0.5,
+  },
+  section: {
+    marginBottom: 24,
+  },
+  sectionTitle: {
+    fontSize: 11,
+    fontWeight: '900',
+    letterSpacing: 1.5,
+    marginBottom: 12,
+    marginLeft: 4,
+  },
+  statusCard: {
+    borderRadius: 20,
+    padding: 16,
+    borderWidth: 1,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.02,
+    shadowRadius: 4,
+    elevation: 1,
+  },
+  statusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'transparent',
+  },
+  statusLabel: {
+    flex: 1,
+    marginLeft: 12,
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  statusValue: {
+    fontSize: 14,
+    fontWeight: '900',
+  },
+  statsGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+    backgroundColor: 'transparent',
+    gap: 12,
+  },
+  statCard: {
+    borderRadius: 20,
+    padding: 16,
+    width: '48%',
+    borderWidth: 1,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.02,
+    shadowRadius: 4,
+    elevation: 1,
+  },
+  statHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: 'transparent',
+    marginBottom: 10,
+  },
+  statBadge: {
+    fontSize: 9,
+    fontWeight: '900',
+    paddingVertical: 2,
+    paddingHorizontal: 8,
+    borderRadius: 8,
+    overflow: 'hidden',
+  },
+  statNumber: {
+    fontSize: 24,
+    fontWeight: '900',
+    marginBottom: 2,
+  },
+  statName: {
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  tasksCard: {
+    borderWidth: 1,
+    borderRadius: 16,
+    padding: 16,
+    marginTop: 8,
+  },
+  tasksHeader: {
+    fontSize: 14,
+    fontWeight: '800',
+    marginBottom: 12,
+  },
+  taskItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    borderTopWidth: 1,
+  },
+  taskTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  taskDate: {
+    fontSize: 12,
+    color: '#6B7280',
+    fontWeight: '500',
+  },
+  emptyTaskText: {
+    fontSize: 13,
+    color: '#9CA3AF',
+    fontStyle: 'italic',
+    textAlign: 'center',
+    paddingVertical: 12,
+  },
+  infoCard: {
+    flexDirection: 'row',
+    padding: 16,
+    borderRadius: 20,
+    borderWidth: 1,
+    alignItems: 'center',
+    marginBottom: 30,
+  },
+  infoText: {
+    flex: 1,
+    marginLeft: 12,
+    fontSize: 12,
+    lineHeight: 18,
+    fontWeight: '600',
+  },
+  cameraContainer: {
+    flex: 1,
+    backgroundColor: '#000',
+  },
+  camera: {
+    flex: 1,
+  },
+  cameraControls: {
+    position: 'absolute',
+    bottom: 0,
+    flexDirection: 'row',
+    width: '100%',
+    justifyContent: 'space-around',
+    alignItems: 'center',
+    padding: 30,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+  },
+  cameraButton: {
+    padding: 15,
+  },
+  cameraCaptureButton: {
+    width: 70,
+    height: 70,
+    borderRadius: 35,
+    backgroundColor: 'rgba(255,255,255,0.3)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  cameraCaptureInner: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    backgroundColor: '#FFF',
+  },
+  festiveCard: {
+    backgroundColor: '#FEF3C7',
+    borderRadius: 20,
+    overflow: 'hidden',
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#FDE68A',
+  },
+  festiveBannerImage: {
+    width: '100%',
+    height: 140,
+  },
+  festiveCardOverlay: {
+    padding: 16,
+    backgroundColor: '#FFFBEB',
+  },
+  festiveBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    backgroundColor: '#FEF3C7',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 12,
+    gap: 4,
+    marginBottom: 6,
+    borderWidth: 1,
+    borderColor: '#FDE68A',
+  },
+  festiveBadgeText: {
+    fontSize: 9,
+    fontWeight: '900',
+    color: '#92400E',
+    letterSpacing: 0.5,
+  },
+  festiveTitle: {
+    fontSize: 18,
+    fontWeight: '900',
+    color: '#78350F',
+    marginBottom: 2,
+  },
+  festiveSubTitle: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#92400E',
+    marginBottom: 6,
+  },
+  festiveMessage: {
+    fontSize: 12,
+    color: '#78350F',
+    fontStyle: 'italic',
+    lineHeight: 18,
+  },
+});

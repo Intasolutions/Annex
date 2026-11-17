@@ -1,0 +1,456 @@
+import uuid
+from django.db import models
+from django.conf import settings
+from core.models import Student
+from core.validators import validate_audio_recording_file
+from django.utils import timezone
+from django.db.models import Q
+
+class PipelineStage(models.Model):
+    name = models.CharField(max_length=50) # e.g. "New Lead", "Follow-up", "In Discussion", "Enrolled", "Dropped"
+    order = models.PositiveIntegerField(default=0)
+    color = models.CharField(max_length=20, default="#e2e8f0") # Hex color for UI
+    is_default = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ['order']
+
+    def __str__(self):
+        return self.name
+
+class LeadInteraction(models.Model):
+    INTERACTION_TYPES = (
+        ('NOTE', 'Note'),
+        ('CALL', 'Phone Call'),
+        ('EMAIL', 'Email'),
+        ('MEETING', 'Meeting'),
+        ('WHATSAPP', 'WhatsApp'),
+    )
+    source_name = models.CharField(
+        max_length=100,
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+
+    source_event_id = models.CharField(
+        max_length=200,
+        null=True,
+        blank=True,
+    )
+    CALL_DIRECTION_CHOICES = (
+        ('INCOMING', 'Incoming'),
+        ('OUTGOING', 'Outgoing'),
+    )
+    CALL_STATUS_CHOICES = (
+        ('CONNECTED', 'Connected'),
+        ('MISSED', 'Missed'),
+        ('REJECTED', 'Rejected'),
+        ('UNANSWERED', 'Unanswered'),
+        ('BUSY', 'Busy'),
+        ('FAILED', 'Failed'),
+    )
+
+    student = models.ForeignKey(Student, on_delete=models.SET_NULL, null=True, blank=True, related_name='crm_interactions')
+    author = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
+    interaction_type = models.CharField(max_length=20, choices=INTERACTION_TYPES, default='NOTE')
+    
+    # Telephony & Call Logging Fields
+    mobile_call_id = models.CharField(max_length=150, blank=True, null=True, unique=True, db_index=True, help_text="Unique client-generated mobile call ID for deduplication")
+    customer_number = models.CharField(max_length=50, blank=True, null=True, db_index=True, help_text="Customer / Lead phone number")
+    caller_number = models.CharField(max_length=50, blank=True, null=True, db_index=True, help_text="Caller phone number")
+    receiver_number = models.CharField(max_length=50, blank=True, null=True, db_index=True, help_text="Receiver / Destination phone number")
+    call_direction = models.CharField(max_length=20, choices=CALL_DIRECTION_CHOICES, default='OUTGOING', null=True, blank=True)
+    call_status = models.CharField(max_length=30, choices=CALL_STATUS_CHOICES, null=True, blank=True)
+    call_duration = models.IntegerField(default=0, help_text="Duration in seconds")
+    start_time = models.DateTimeField(null=True, blank=True)
+    end_time = models.DateTimeField(null=True, blank=True)
+    
+    notes = models.TextField(blank=True, default='')
+    audio_recording = models.FileField(upload_to='call_recordings/%Y/%m/', null=True, blank=True, validators=[validate_audio_recording_file])
+    audio_file_hash = models.CharField(max_length=64, blank=True, null=True, db_index=True, help_text="SHA-256 hash of audio content to prevent duplicate cross-call attachment")
+    recording_url = models.CharField(max_length=1000, blank=True, null=True, help_text="Remote/telephony audio recording URL")
+    
+    provider_call_id = models.CharField(max_length=150, blank=True, null=True, db_index=True, help_text="Provider call ID")
+    provider_event_id = models.CharField(max_length=150, blank=True, null=True, db_index=True, help_text="Provider event ID")
+    telephony_provider = models.CharField(max_length=50, blank=True, null=True, default='MOBILE_APP')
+    is_matched = models.BooleanField(default=False, help_text="Whether this call is linked to an existing CRM Student/Lead")
+    
+    date = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-date']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['source_name', 'source_event_id'],
+                condition=(
+                    Q(source_name__isnull=False)
+                    & ~Q(source_name='')
+                    & Q(source_event_id__isnull=False)
+                    & ~Q(source_event_id='')
+                ),
+                name='unique_external_source_event',
+            ),
+        ]
+
+    def __str__(self):
+        target = f"{self.student.first_name} {self.student.last_name}".strip() if self.student else (self.customer_number or self.caller_number or 'Unknown')
+        direction = self.call_direction or 'OUTGOING'
+        date_str = self.date.strftime('%Y-%m-%d') if self.date else ''
+        return f"{self.interaction_type} ({direction}) with {target} on {date_str}"
+
+    def save(self, *args, **kwargs):
+        is_unconnected = (self.call_status or '').upper() in ['MISSED', 'REJECTED', 'UNANSWERED', 'FAILED']
+        if is_unconnected:
+            self.call_duration = 0
+            if self.audio_recording:
+                try:
+                    self.audio_recording.delete(save=False)
+                except Exception:
+                    pass
+                self.audio_recording = None
+            self.recording_url = None
+            self.audio_file_hash = None
+        elif self.audio_recording:
+            # Only compute hash and duration if audio file is newly assigned or hash is missing
+            is_new_file = not getattr(self.audio_recording, '_committed', True)
+            if is_new_file or not self.audio_file_hash:
+                try:
+                    from .utils import extract_audio_duration, compute_audio_hash
+                    file_hash = compute_audio_hash(self.audio_recording)
+                    # Check for duplicate audio binary on another distinct call
+                    if file_hash:
+                        dup_query = LeadInteraction.objects.filter(audio_file_hash=file_hash)
+                        if self.pk:
+                            dup_query = dup_query.exclude(pk=self.pk)
+                        if self.mobile_call_id:
+                            dup_query = dup_query.exclude(mobile_call_id=self.mobile_call_id)
+
+                        if dup_query.exists():
+                            # Duplicate binary detected on a different call - reject cross-attachment!
+                            try:
+                                self.audio_recording.delete(save=False)
+                            except Exception:
+                                pass
+                            self.audio_recording = None
+                            self.audio_file_hash = None
+                        else:
+                            self.audio_file_hash = file_hash
+                            rec_dur = extract_audio_duration(self.audio_recording)
+                            if rec_dur > 0:
+                                self.call_duration = rec_dur
+                    else:
+                        self.audio_recording = None
+                        self.audio_file_hash = None
+                except Exception:
+                    pass
+        super().save(*args, **kwargs)
+
+
+
+class Campaign(models.Model):
+    STATUS_CHOICES = (
+        ('ACTIVE', 'Active'),
+        ('PAUSED', 'Paused'),
+        ('COMPLETED', 'Completed'),
+    )
+    PLATFORM_CHOICES = (
+        ('FACEBOOK', 'Facebook Ads'),
+        ('GOOGLE', 'Google Ads'),
+        ('INSTAGRAM', 'Instagram Ads'),
+        ('LINKEDIN', 'LinkedIn Ads'),
+        ('WALKIN', 'Walk-in / Offline'),
+        ('OTHER', 'Other'),
+    )
+    name = models.CharField(max_length=255)
+    description = models.TextField(blank=True, null=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ACTIVE')
+    platform = models.CharField(max_length=20, choices=PLATFORM_CHOICES, default='OTHER')
+    start_date = models.DateField(null=True, blank=True)
+    end_date = models.DateField(null=True, blank=True)
+    budget = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    
+    SECTION_CHOICES = (
+        ('CAREER_ACADEMY', 'Career Academy'),
+        ('REGULAR', 'Regular'),
+        ('BOTH', 'Both'),
+    )
+    section = models.CharField(max_length=20, choices=SECTION_CHOICES, default='BOTH')
+    
+    # Meta Facebook Lead Ads Integration
+    meta_page_id = models.CharField(max_length=100, null=True, blank=True, help_text='Facebook Page ID that this campaign belongs to')
+    meta_form_id = models.CharField(max_length=100, null=True, blank=True, help_text='Facebook Lead Ad Form ID for auto-matching incoming leads')
+    meta_ad_id = models.CharField(max_length=100, null=True, blank=True, help_text='Facebook Ad ID (optional, for more precise matching)')
+    meta_pixel_id = models.CharField(max_length=100, null=True, blank=True, help_text='Facebook Pixel ID for Conversions API')
+    meta_access_token = models.TextField(null=True, blank=True, help_text='Meta Page Access Token for Conversions API - keep this secret!')
+    meta_auto_import = models.BooleanField(default=False, help_text='If enabled, leads from this Meta form auto-import into CRM')
+    
+    # Auto-Assignment to selected Sales Representatives
+    auto_assign_to = models.ManyToManyField(settings.AUTH_USER_MODEL, blank=True, related_name='assigned_meta_campaigns', help_text='Sales representatives to auto-assign incoming leads to (Round-Robin)')
+    last_assigned_bde = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='last_assigned_campaigns', help_text='The last sales representative assigned a lead for this campaign')
+    
+    # Campaign-wise Webhook Integration (e.g. Google Sheets)
+    secret_token = models.UUIDField(default=uuid.uuid4, editable=False, unique=True, null=True, help_text='Secret token for Campaign-linked webhooks')
+    
+    # Google Sheets OAuth Direct Integration
+    google_spreadsheet_id = models.CharField(max_length=255, null=True, blank=True, help_text='Google Sheets Spreadsheet ID')
+    google_sheet_name = models.CharField(max_length=100, null=True, blank=True, help_text='Sheet Tab name (e.g., Sheet1)')
+    google_access_token = models.TextField(null=True, blank=True)
+    google_refresh_token = models.TextField(null=True, blank=True)
+    google_token_expiry = models.DateTimeField(null=True, blank=True)
+    google_last_synced_row = models.IntegerField(default=0, help_text='The last row index imported from this sheet')
+    google_auto_sync = models.BooleanField(default=False, help_text='Automatically sync leads from this sheet in the background')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return self.name
+
+import uuid
+
+class Task(models.Model):
+    TASK_TYPES = (
+        ('CALL', 'Phone Call'),
+        ('EMAIL', 'Email'),
+        ('MEETING', 'Meeting'),
+        ('OTHER', 'Other'),
+    )
+    STATUS_CHOICES = (
+        ('PENDING', 'Pending'),
+        ('COMPLETED', 'Completed'),
+        ('CANCELLED', 'Cancelled'),
+    )
+    title = models.CharField(max_length=255)
+    student = models.ForeignKey(Student, on_delete=models.CASCADE, related_name='crm_tasks', null=True, blank=True)
+    assigned_to = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='assigned_crm_tasks')
+    task_type = models.CharField(max_length=20, choices=TASK_TYPES, default='CALL')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
+    due_date = models.DateTimeField(null=True, blank=True)
+    notes = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['due_date']
+
+    def __str__(self):
+        return f"{self.title} - {self.status}"
+
+
+class WebhookEndpoint(models.Model):
+    name = models.CharField(max_length=100) # e.g. "Zapier FB Ads"
+    secret_token = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
+
+    def __str__(self):
+        return self.name
+
+class WebhookLog(models.Model):
+    STATUS_CHOICES = (
+        ('SUCCESS', 'Success'),
+        ('FAILED', 'Failed'),
+    )
+    endpoint = models.ForeignKey(WebhookEndpoint, on_delete=models.CASCADE, related_name='logs')
+    payload = models.JSONField(default=dict)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='SUCCESS')
+    error_message = models.TextField(blank=True, null=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-timestamp']
+
+    def __str__(self):
+        return f"{self.endpoint.name} - {self.status} at {self.timestamp}"
+
+
+
+class LeadTask(models.Model):
+    STATUS_CHOICES = (
+        ('PENDING', 'Pending'),
+        ('IN_PROGRESS', 'In Progress'),
+        ('COMPLETED', 'Completed'),
+    )
+    title = models.CharField(max_length=255)
+    assigned_to = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True, related_name='assigned_lead_tasks')
+    assigned_bdes = models.ManyToManyField(settings.AUTH_USER_MODEL, related_name='multi_assigned_lead_tasks', blank=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='created_lead_tasks')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        assignee_str = self.assigned_to.username if self.assigned_to else f"{self.assigned_bdes.count()} BDEs"
+        return f"{self.title} ({self.status}) - {assignee_str}"
+
+    @property
+    def total_leads(self):
+        return self.items.count()
+
+    @property
+    def completed_leads(self):
+        return self.items.filter(is_completed=True).count()
+
+    @property
+    def progress_percent(self):
+        total = self.total_leads
+        if total == 0:
+            return 0
+        return int((self.completed_leads / total) * 100)
+
+    def update_status_from_items(self, save=True):
+        total = self.items.count()
+        completed = self.items.filter(is_completed=True).count()
+        if total == 0:
+            new_status = 'PENDING'
+        elif completed == total:
+            new_status = 'COMPLETED'
+        elif completed > 0:
+            new_status = 'IN_PROGRESS'
+        else:
+            new_status = 'PENDING'
+
+        if self.status != new_status:
+            self.status = new_status
+            if save:
+                self.save(update_fields=['status', 'updated_at'])
+        return self.status
+
+
+class LeadTaskItem(models.Model):
+    task = models.ForeignKey(LeadTask, on_delete=models.CASCADE, related_name='items')
+    lead = models.ForeignKey(Student, on_delete=models.CASCADE, related_name='lead_task_items')
+    assigned_to = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True, related_name='assigned_lead_task_items')
+    is_completed = models.BooleanField(default=False)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    completed_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='completed_lead_task_items')
+    notes = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['created_at']
+        unique_together = ('task', 'lead')
+
+    def __str__(self):
+        return f"Task {self.task_id} - Lead {self.lead_id} ({'Done' if self.is_completed else 'Pending'})"
+
+
+class LeadTaskAssignmentHistory(models.Model):
+    task = models.ForeignKey(LeadTask, on_delete=models.CASCADE, related_name='assignment_history')
+    item = models.ForeignKey(LeadTaskItem, on_delete=models.CASCADE, null=True, blank=True, related_name='assignment_history')
+    previous_assignee = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
+    new_assignee = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='+')
+    reassigned_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
+    reassigned_at = models.DateTimeField(auto_now_add=True)
+    notes = models.TextField(blank=True, default='')
+
+    class Meta:
+        ordering = ['-reassigned_at']
+
+    def __str__(self):
+        return f"Task {self.task_id} assigned to {self.new_assignee} at {self.reassigned_at}"
+
+
+
+
+
+
+class MetaConversionEvent(models.Model):
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('SENT', 'Sent'),
+        ('FAILED', 'Failed'),
+    ]
+
+    id = models.UUIDField(
+        primary_key=True,
+        default=uuid.uuid4,
+        editable=False
+    )
+
+    student = models.ForeignKey(
+        Student,
+        on_delete=models.CASCADE,
+        related_name='meta_conversion_events'
+    )
+
+    campaign = models.ForeignKey(
+        "crm.Campaign",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="meta_conversion_events",
+    )
+
+    event_name = models.CharField(max_length=150)
+    idempotency_key = models.CharField(
+        max_length=255,
+        unique=True,
+        null=True,
+        blank=True,
+        help_text="Unique key preventing duplicate Meta conversion events.",
+    )
+    payload = models.JSONField(default=dict, blank=True)
+    previous_stage = models.CharField(
+        max_length=100, blank=True, null=True
+    )
+    current_stage = models.CharField(max_length=100)
+
+    event_time = models.DateTimeField(default=timezone.now)
+
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default='PENDING',
+        db_index=True
+    )
+
+    attempts = models.PositiveIntegerField(default=0)
+    max_attempts = models.PositiveIntegerField(default=8)
+
+    next_retry_at = models.DateTimeField(
+        default=timezone.now,
+        db_index=True
+    )
+
+    processing_started_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+
+    last_http_status = models.PositiveIntegerField(
+        null=True, blank=True
+    )
+
+    meta_response = models.JSONField(default=dict, blank=True)
+    last_error = models.TextField(blank=True, default='')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['created_at']
+        indexes = [
+            models.Index(
+                fields=['status', 'next_retry_at'],
+                name='meta_event_retry_idx'
+            ),
+            models.Index(
+                fields=['student', 'created_at'],
+                name='meta_event_student_idx'
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.event_name} - {self.student_id} - {self.status}"
+

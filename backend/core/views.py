@@ -1,0 +1,3041 @@
+
+from rest_framework import viewsets, permissions, status, filters
+from rest_framework.filters import SearchFilter
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from django.db.models import Q, Sum, Count, F, Count
+from rest_framework.permissions import IsAuthenticated
+from django.http import HttpResponse
+from django.contrib.auth import get_user_model
+from django.utils import timezone
+from decimal import Decimal, InvalidOperation
+import pandas as pd
+from django.db.models import ProtectedError
+import uuid
+from django.utils import timezone
+from datetime import timedelta
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from django.utils.dateparse import parse_datetime
+from django.core.exceptions import ValidationError as DjangoValidationError
+from .validators import validate_audio_recording_file
+
+
+from .models import Program, SubProgram, Course, Batch, Student, Transaction, Document, SyllabusPart, ClassSession, Attendance, BatchResource, Exam, ExamResult, Question, QuestionOption, StudentSubmission, MonthlyPayment, StudentTeacherHandover, StudentFeedback
+from .serializers import (
+    ProgramSerializer, SubProgramSerializer, CourseSerializer, 
+    BatchSerializer, StudentSerializer, TransactionSerializer, DocumentSerializer,
+    ProgramHierarchySerializer, SyllabusPartSerializer, ClassSessionSerializer, AttendanceSerializer, BatchResourceSerializer,
+    ExamSerializer, ExamResultSerializer, QuestionSerializer, StudentSubmissionSerializer, MonthlyPaymentSerializer, StudentTeacherHandoverSerializer,StudentFeedbackSerializer
+)
+from rest_framework.views import APIView
+from .permissions import DynamicRolePermission, IsMentorOwner
+
+MENTOR_ROLES = ['MENTOR', 'TEACHER', 'HEAD - MENTOR', 'ACADEMIC MENTOR', 'ACADEMIC', 'ACADEMIC_COORDINATOR', 'ADMIN', 'SUPER_ADMIN' ]
+
+UNCONNECTED = ('MISSED', 'REJECTED', 'UNANSWERED', 'FAILED', 'BUSY')
+
+class IsAdminOrReadOnly(permissions.BasePermission):
+    def has_permission(self, request, view):
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        return request.user.is_authenticated and request.user.role in ['ADMIN', 'SUPER_ADMIN']
+
+class ProgramViewSet(viewsets.ModelViewSet):
+    queryset = Program.objects.all()
+    serializer_class = ProgramSerializer
+    permission_classes = [DynamicRolePermission]
+    module_name = 'ACADEMIC'
+    pagination_class = None
+    filter_backends = [SearchFilter]
+    search_fields = ['name', 'description']
+    
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve', 'hierarchy']:
+            return [permissions.AllowAny()]
+        return super().get_permissions()
+
+    @action(detail=False, methods=['get'])
+    def hierarchy(self, request):
+        programs = self.get_queryset()
+        serializer = ProgramHierarchySerializer(programs, many=True)
+        return Response(serializer.data)
+
+
+    def destroy(self, request, *args, **kwargs):
+        program = self.get_object()
+
+        linked_students = Student.objects.filter(
+            Q(program_type=program) |
+            Q(sub_program__program=program) |
+            Q(course__sub_program__program=program)
+        ).count()
+
+        if linked_students:
+            return Response(
+                {"error": f"Cannot delete '{program.name}': {linked_students} student(s)/lead(s) are linked to this brand."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            program.delete()
+        except ProtectedError:
+            return Response(
+                {"error": "This brand is linked to other records and cannot be deleted."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+    def get_queryset(self):
+        qs = Program.objects.all()
+        user = self.request.user
+
+        # Management actions always see everything
+        if self.action in ['update', 'partial_update', 'destroy', 'toggle_active']:
+            return qs
+
+        # Only logged-in staff can ask for inactive brands (used by the admin screen)
+        include_inactive = (
+            self.request.query_params.get('include_inactive') == 'true'
+            and user.is_authenticated
+        )
+        if not include_inactive:
+            qs = qs.filter(is_active=True)
+        return qs
+
+    @action(detail=True, methods=['post'])
+    def toggle_active(self, request, pk=None):
+        program = self.get_object()
+        program.is_active = not program.is_active
+        program.save(update_fields=['is_active'])
+        return Response({'id': program.id, 'is_active': program.is_active})
+
+class SubProgramViewSet(viewsets.ModelViewSet):
+    queryset = SubProgram.objects.all()
+    serializer_class = SubProgramSerializer
+    permission_classes = [DynamicRolePermission]
+    module_name = 'ACADEMIC'
+    pagination_class = None
+    filter_backends = [SearchFilter]
+    search_fields = ['name']
+
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve']:
+            return [permissions.AllowAny()]
+        return super().get_permissions()
+
+    def get_queryset(self):
+        queryset = SubProgram.objects.all()
+        program_id = self.request.query_params.get('program')
+        if program_id:
+            queryset = queryset.filter(program_id=program_id)
+        return queryset
+
+class CourseViewSet(viewsets.ModelViewSet):
+    queryset = Course.objects.all()
+    serializer_class = CourseSerializer
+    permission_classes = [DynamicRolePermission]
+    module_name = 'ACADEMIC'
+    pagination_class = None
+    filter_backends = [SearchFilter]
+    search_fields = ['name']
+
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve']:
+            return [permissions.AllowAny()]
+        return super().get_permissions()
+
+    def get_queryset(self):
+        queryset = Course.objects.all()
+        sub_program_id = self.request.query_params.get('sub_program')
+        if sub_program_id:
+            queryset = queryset.filter(sub_program_id=sub_program_id)
+        return queryset
+
+class BatchViewSet(viewsets.ModelViewSet):
+    serializer_class = BatchSerializer
+    queryset = Batch.objects.all()
+    filter_backends = [SearchFilter]
+    search_fields = ['name', 'primary_mentor__first_name', 'primary_mentor__last_name', 'teacher__first_name', 'teacher__last_name', 'course__name']
+    permission_classes = [DynamicRolePermission, IsMentorOwner]
+    @property
+    def module_name(self):
+        # Determine module based on user role for shared view
+        if hasattr(self, 'request') and self.request.user.is_authenticated:
+            if self.request.user.role == 'TEACHER':
+                return 'TEACHER'
+        return 'MENTOR'
+
+    def get_permissions(self):
+        if self.request.user.is_authenticated and self.action in ['list', 'retrieve']:
+            if self.request.user.role in ['ACADEMIC', 'ACADEMIC_COORDINATOR', 'ADMIN', 'SUPER_ADMIN']:
+                return [permissions.IsAuthenticated()]
+        return super().get_permissions()
+
+    def get_queryset(self):
+        user = self.request.user
+        qs = Batch.objects.select_related('primary_mentor', 'course').prefetch_related('secondary_mentors')
+        qs = qs.annotate(student_count_annotated=Count('students'))
+        
+        if user.role in ['ADMIN', 'SUPER_ADMIN', 'ACADEMIC', 'ACADEMIC_COORDINATOR', 'SALES']:
+            pass
+        elif user.role in ['MENTOR', 'TEACHER']:
+            # Include subordinates if any
+            subordinates = (
+                user.get_all_subordinates()
+                if hasattr(user, 'get_all_subordinates')
+                else []
+            )
+            if subordinates:
+                # User can see their own batches AND their subordinates' batches
+                users_to_check = [user] + subordinates
+                qs = qs.filter(Q(primary_mentor__in=users_to_check) | Q(secondary_mentors__in=users_to_check) | Q(teacher__in=users_to_check)).distinct()
+            else:
+                qs = qs.filter(Q(primary_mentor=user) | Q(secondary_mentors=user) | Q(teacher=user)).distinct()
+        elif user.role == 'STUDENT':
+            qs = qs.filter(students__user=user).distinct()
+        else:
+            return Batch.objects.none()
+            
+        mentor_id = self.request.query_params.get('mentor_id')
+        if mentor_id:
+            qs = qs.filter(primary_mentor_id=mentor_id)
+                    
+        teacher_id = self.request.query_params.get('teacher_id')
+        if teacher_id:
+            qs = qs.filter(teacher_id=teacher_id)
+            
+        return qs.order_by('-id')
+
+    @action(detail=True, methods=['post'])
+    def add_student(self, request, pk=None):
+        try:
+            batch = self.get_object()
+        except:
+            return Response({'error': 'Batch not found or access denied'}, status=status.HTTP_404_NOT_FOUND)
+            
+        student_id = request.data.get('student_id')
+        try:
+            student = Student.objects.get(id=student_id)
+            student.batch = batch
+            student.save()
+            
+            from notifications.models import Notification
+            if batch.primary_mentor:
+                Notification.objects.create(
+                    user=batch.primary_mentor,
+                    title="New Student Assigned",
+                    message=f"Student {student.first_name} has been added to your batch {batch.name}.",
+                    notification_type='BATCH',
+                    target_url=f"/mentor"
+                )
+            
+            return Response({'status': 'student added'})
+        except Student.DoesNotExist:
+            return Response({'error': 'Student not found'}, status=status.HTTP_404_NOT_FOUND)
+
+    @action(detail=True, methods=['post'])
+    def bulk_add_students(self, request, pk=None):
+        try:
+            batch = self.get_object()
+        except:
+            return Response({'error': 'Batch not found or access denied'}, status=status.HTTP_404_NOT_FOUND)
+            
+        student_ids = request.data.get('student_ids', [])
+        if not student_ids:
+            return Response({'error': 'No student IDs provided'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        students = Student.objects.filter(id__in=student_ids)
+        students.update(batch=batch)
+        
+        from notifications.models import Notification
+        if batch.primary_mentor:
+            for student in students:
+                Notification.objects.create(
+                    user=batch.primary_mentor,
+                    title="Student Assigned",
+                    message=f"Student {student.first_name} has been added to your batch {batch.name}.",
+                    notification_type='BATCH',
+                    target_url=f"/mentor"
+                )
+        
+        return Response({'status': f'Students added'})
+
+    @action(detail=True, methods=['post'])
+    def remove_student(self, request, pk=None):
+        try:
+            batch = self.get_object()
+        except:
+            return Response({'error': 'Batch not found or access denied'}, status=status.HTTP_404_NOT_FOUND)
+
+        student_id = request.data.get('student_id')
+        try:
+            student = Student.objects.get(id=student_id, batch=batch)
+            student.batch = None
+            student.save()
+            return Response({'status': 'student removed'})
+        except Student.DoesNotExist:
+            return Response({'error': 'Student not found in this batch'}, status=status.HTTP_404_NOT_FOUND)
+
+    @action(detail=True, methods=['post'])
+    def reassign(self, request, pk=None):
+        try:
+            batch = self.get_object()
+        except:
+            return Response({'error': 'Batch not found or access denied'}, status=status.HTTP_404_NOT_FOUND)
+            
+        new_mentor_id = request.data.get('new_mentor_id')
+        reason = request.data.get('reason', '')
+        
+        if not new_mentor_id:
+            return Response({'error': 'new_mentor_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        User = get_user_model()
+        try:
+            new_mentor = User.objects.get(id=new_mentor_id)
+        except User.DoesNotExist:
+            return Response({'error': 'New mentor not found'}, status=status.HTTP_404_NOT_FOUND)
+            
+        previous_mentor = batch.primary_mentor
+        
+        if previous_mentor and previous_mentor.id == new_mentor.id:
+            return Response({'error': 'Mentor is already assigned to this batch'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        # Update batch
+        batch.primary_mentor = new_mentor
+        batch.save()
+        
+        # Create history record
+        from core.models import BatchAssignmentHistory
+        BatchAssignmentHistory.objects.create(
+            batch=batch,
+            previous_mentor=previous_mentor,
+            new_mentor=new_mentor,
+            assigned_by=request.user,
+            reason=reason
+        )
+        
+        from notifications.models import Notification
+        Notification.objects.create(
+            user=new_mentor,
+            title="Batch Reassigned",
+            message=f"You have been assigned to batch {batch.name}.",
+            notification_type='BATCH',
+            target_url=f"/mentor"
+        )
+        
+        return Response({'status': 'Batch reassigned successfully'})
+
+    @action(detail=True, methods=['get'])
+    def assignment_history(self, request, pk=None):
+        try:
+            batch = self.get_object()
+        except:
+            return Response({'error': 'Batch not found or access denied'}, status=status.HTTP_404_NOT_FOUND)
+            
+        from core.models import BatchAssignmentHistory
+        from core.serializers import BatchAssignmentHistorySerializer
+        
+        history = BatchAssignmentHistory.objects.filter(batch=batch).order_by('-assigned_at')
+        serializer = BatchAssignmentHistorySerializer(history, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
+    def log_session(self, request, pk=None):
+        batch = self.get_object()
+        date = request.data.get('date')
+        summary = request.data.get('teacher_summary')
+        completed_parts = request.data.get('completed_parts', [])
+        attendance_data = request.data.get('attendance', {})
+        
+        if not date:
+            return Response({'error': 'Date is required'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        session = ClassSession.objects.create(batch=batch, date=date, teacher_summary=summary)
+        
+        if completed_parts:
+            SyllabusPart.objects.filter(id__in=completed_parts, batch=batch).update(is_completed=True)
+            
+        for student_id, is_present in attendance_data.items():
+            try:
+                Attendance.objects.create(session=session, student_id=student_id, is_present=bool(is_present))
+            except:
+                pass
+                
+        return Response({'status': 'Session logged successfully'})
+
+class StudentViewSet(viewsets.ModelViewSet):
+    queryset = Student.objects.all()
+    serializer_class = StudentSerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['first_name', 'last_name', 'crm_student_id', 'mobile', 'email']
+    ordering_fields = ['created_at', 'id']
+    permission_classes = [DynamicRolePermission]
+    module_name = 'SALES'
+
+    def filter_queryset(self, queryset):
+        ordering = self.request.query_params.get('ordering')
+        if ordering == 'created_at':
+            self.request.query_params._mutable = True
+            self.request.query_params['ordering'] = 'id'
+            self.request.query_params._mutable = False
+        elif ordering == '-created_at':
+            self.request.query_params._mutable = True
+            self.request.query_params['ordering'] = '-id'
+            self.request.query_params._mutable = False
+        return super().filter_queryset(queryset)
+
+    def update(self, request, *args, **kwargs):
+        if 'cre_update' in request.data:
+            user = request.user
+            if not user or not user.is_authenticated:
+                return Response({'detail': 'Authentication required to modify CRE Update.'}, status=status.HTTP_401_UNAUTHORIZED)
+            allowed_roles = ['SALES', 'TEAM_LEAD', 'SALES_HEAD', 'SALES_MANAGER', 'MANAGER', 'SALES_LEAD', 'ADMIN', 'SUPER_ADMIN']
+            if user.role not in allowed_roles and not user.is_superuser and not user.is_staff:
+                return Response({'detail': 'You do not have permission to modify CRE Update.'}, status=status.HTTP_403_FORBIDDEN)
+        return super().update(request, *args, **kwargs)
+
+    
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        old_status = getattr(instance, 'lead_status', None)
+
+        # Prevent unauthenticated users from changing lead status
+        if (
+            'lead_status' in serializer.validated_data
+            and not self.request.user.is_authenticated
+        ):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied(
+                "Authentication is required to change lead status."
+            )
+
+        updated_instance = serializer.save()
+        new_status = getattr(updated_instance, 'lead_status', None)
+
+        if old_status == new_status:
+            return
+
+        try:
+            from crm.models import PipelineStage, LeadInteraction
+            from crm.utils import get_converted_stage_values
+
+            stages_map = {
+                str(stage.id): stage.name
+                for stage in PipelineStage.objects.all()
+            }
+
+            old_name = stages_map.get(str(old_status), str(old_status))
+            new_name = stages_map.get(str(new_status), str(new_status))
+
+            converted_values = {
+                str(value).strip().casefold()
+                for value in get_converted_stage_values()
+            }
+
+            old_is_converted = (
+                str(old_status).strip().casefold() in converted_values
+            )
+            new_is_converted = (
+                str(new_status).strip().casefold() in converted_values
+            )
+
+            # Send Meta event only when entering converted/enrolled status
+            if new_is_converted and not old_is_converted:
+                from crm.services.meta_capi import queue_meta_event
+
+                queue_meta_event(
+                    student=updated_instance,
+                    event_name="CompleteRegistration",
+                    request=self.request,
+                    action_source="other",
+                    idempotency_key=(
+                        f"registration:student:{updated_instance.pk}:{uuid.uuid4()}"
+                    ),
+                )
+
+            author = (
+                self.request.user
+                if self.request.user and self.request.user.is_authenticated
+                else None
+            )
+
+            LeadInteraction.objects.create(
+                student=updated_instance,
+                author=author,
+                interaction_type='NOTE',
+                notes=f"Status changed from '{old_name}' to '{new_name}'"
+            )
+
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "Status update processing failed for Student %s",
+                updated_instance.id
+            )
+
+    def get_permissions(self):
+        if self.action in ['create', 'public_lookup']:
+            return [permissions.AllowAny()]
+
+        if self.action == 'partial_update':
+            return [permissions.IsAuthenticated()]
+
+        if self.request.user.is_authenticated:
+            user_role = str(self.request.user.role).upper().strip()
+
+            if self.action == 'destroy':
+                return [permissions.IsAuthenticated()]
+
+            elif self.action in [
+                'list', 'retrieve', 'fee_defaulters', 'collected_fees',
+                'break_metrics', 'record_payment', 'update_fee',
+                'handover_teacher', 'fee_logs', 'payment_records',
+                'edit_payment', 'delete_payment'
+            ]:
+                if user_role in [
+                    'STUDENT', 'ACADEMIC', 'ACADEMIC_COORDINATOR',
+                    'ADMIN', 'SUPER_ADMIN', *MENTOR_ROLES
+                ]:
+                    return [permissions.IsAuthenticated()]
+
+
+            elif self.action in ['add_feedback', 'feedback_recording', 'feedbacks', 'recent_feedbacks', 'feedback_summary']:
+                if user_role in ['ACADEMIC', 'ACADEMIC_COORDINATOR', 'ADMIN', 'SUPER_ADMIN', *MENTOR_ROLES]:
+                    return [permissions.IsAuthenticated()]
+
+        return super().get_permissions()
+
+
+
+    @action(detail=False, methods=['get'], permission_classes=[permissions.AllowAny])
+    def public_lookup(self, request):
+        mobile = request.query_params.get('mobile')
+        sid = request.query_params.get('sid')
+        
+        student = None
+        if sid:
+            student = Student.objects.filter(id=sid, is_active=True).first()
+        elif mobile:
+            student = Student.objects.filter(mobile=mobile, is_active=True).first()
+            
+        if not student:
+            return Response({'error': 'No active student found matching these details.'}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Return summary info to confirm
+        return Response({
+            'id': student.id,
+            'name': f"{student.first_name} {student.last_name}",
+            'program': student.program_type.name,
+            'course': student.course.name if student.course else 'N/A',
+            'mobile': student.mobile,
+            'first_name': student.first_name,
+            'last_name': student.last_name,
+            'email': student.email
+        })
+
+    
+    def perform_create(self, serializer):
+        from rest_framework.exceptions import ValidationError
+        from crm.services.meta_capi import queue_meta_event
+
+        user = (
+            self.request.user
+            if self.request.user and self.request.user.is_authenticated
+            else None
+        )
+
+        # Block public submissions to a deactivated brand
+        program = serializer.validated_data.get('program_type')
+        if program and not program.is_active and not user:
+            raise ValidationError({
+                "error": "This brand is not accepting applications."
+            })
+
+        # Save the lead only once
+        if user and user.role == 'SALES':
+            student = serializer.save(assigned_to=user)
+        else:
+            student = serializer.save()
+
+        # Queue Meta Lead event for ALL lead sources
+        queue_meta_event(
+            student=student,
+            event_name="Lead",
+            request=self.request,
+            action_source="other",
+            idempotency_key=f"lead:student:{student.pk}",
+        )
+
+        # Notify administrators
+        from notifications.models import Notification
+
+        User = get_user_model()
+        staff_users = User.objects.filter(
+            role__in=['ADMIN', 'SUPER_ADMIN']
+        )
+
+        for u in staff_users:
+            Notification.objects.create(
+                user=u,
+                title="New Application Received",
+                message=(
+                    f"Student {student.first_name} {student.last_name} "
+                    f"has applied for {student.program_type.name}."
+                ),
+                notification_type='APPLICATION',
+                target_url=f"/sales?student={student.id}"
+            )
+
+
+    def get_queryset(self):
+        from django.db.models import Q
+        user = self.request.user
+        if not user.is_authenticated:
+            # Allow public submissions (PATCH) for active student profiles via deep links
+            return Student.objects.filter(is_active=True)
+        
+        # Staff/Internal View
+        qs = Student.objects.select_related(
+            'user', 'program_type', 'sub_program', 'course', 'batch', 'batch__primary_mentor', 'batch__teacher',
+            'campaign', 'assigned_to', 'duplicate_of',
+            'duplicate_of__campaign', 'duplicate_of__assigned_to'
+        ).prefetch_related('dynamic_values__field', 'documents', 'transactions', 'monthly_payments').all()
+
+
+
+        from django.db.models import OuterRef, Subquery
+        latest_fb = StudentFeedback.objects.filter(student=OuterRef('pk')).order_by('-feedback_date', '-id')
+        qs = qs.annotate(
+            last_feedback_date=Subquery(latest_fb.values('feedback_date')[:1]),
+            last_feedback_status=Subquery(latest_fb.values('status')[:1]),
+            next_followup_date=Subquery(latest_fb.values('next_followup_date')[:1]),
+        )
+            
+        from crm.utils import get_converted_stage_values
+        converted_stage_ids = get_converted_stage_values()
+
+        lead_status_param = self.request.query_params.get('lead_status', '')
+        is_duplicate_requested = str(lead_status_param).upper() == 'DUPLICATE'
+
+        if self.action in ['destroy', 'retrieve', 'partial_update', 'update']:
+            # Allow retrieving/updating/deleting individual records by ID even if duplicate
+            pass
+        elif is_duplicate_requested:
+            # When duplicate leads are explicitly requested (e.g. "View Duplicate Leads"), isolate to duplicate leads only
+            qs = qs.filter(lead_status__iexact='DUPLICATE')
+        else:
+            # Normal lead queries: strictly isolate by excluding duplicates for ALL roles
+            qs = qs.exclude(lead_status__iexact='DUPLICATE')
+
+        if user.role in ['SALES', 'TEAM_LEAD', 'SALES_HEAD', 'SALES_MANAGER', 'MANAGER', 'SALES_LEAD']:
+            user_section = getattr(user, 'sales_section', 'BOTH')
+            if user_section and user_section != 'BOTH':
+                from django.db.models import Q
+                qs = qs.filter(
+                    Q(assigned_to__sales_section=user_section) |
+                    Q(sales_section=user_section)
+                )
+                
+            from crm.utils import check_is_sales_manager
+            if not check_is_sales_manager(user) and not is_duplicate_requested:
+                # STRICT ACCESS CONTROL: Standard SALES employee only sees leads assigned to them
+                qs = qs.filter(assigned_to=user)
+            elif user.role == 'TEAM_LEAD' and not is_duplicate_requested:
+                subordinates = user.get_all_subordinates() if hasattr(user, 'get_all_subordinates') else []
+                if not subordinates and hasattr(user, 'hrms_profile') and hasattr(user.hrms_profile, 'subordinates'):
+                    hrms_subs = user.hrms_profile.subordinates.select_related('user').all()
+                    subordinates = [sub.user for sub in hrms_subs if sub.user]
+                if subordinates:
+                    team_user_ids = [user.id] + [s.id for s in subordinates]
+                    qs = qs.filter(assigned_to_id__in=team_user_ids)
+        elif user.role in MENTOR_ROLES:
+            # Mobile app sends own_only=true: only this mentor's own batches, no subordinates
+            own_only = self.request.query_params.get('own_only') == 'true'
+            subordinates = [] if own_only else list(user.get_all_subordinates())
+            users_to_check = [user] + subordinates
+            qs = qs.filter(
+                Q(batch__primary_mentor__in=users_to_check) |
+                Q(batch__secondary_mentors__in=users_to_check) |
+                Q(batch__teacher__in=users_to_check)
+            ).filter(lead_status__in=converted_stage_ids).distinct()
+        elif user.role in ['ACADEMIC', 'ACADEMIC_COORDINATOR'] or self.request.query_params.get('group', '').upper() == 'ACADEMIC':
+            qs = qs.filter(lead_status__in=converted_stage_ids)
+        elif user.role == 'STUDENT':
+            qs = Student.objects.filter(user=user)
+        
+        # Apply Filters
+        if self.action != 'destroy':
+            is_active = self.request.query_params.get('is_active', 'true').lower() == 'true'
+            qs = qs.filter(is_active=is_active)
+        
+        hide_converted = self.request.query_params.get('hide_converted')
+        if hide_converted == 'true':
+            from crm.utils import get_converted_stage_values
+            qs = qs.exclude(lead_status__in=get_converted_stage_values())
+
+        hide_dropped = self.request.query_params.get('hide_dropped')
+        if hide_dropped == 'true':
+            from crm.utils import get_dropped_stage_values
+            qs = qs.exclude(lead_status__in=get_dropped_stage_values())
+
+        # sales_section_filter = self.request.query_params.get('sales_section')
+        # if sales_section_filter and sales_section_filter.upper() != 'ALL':
+        #     qs = qs.filter(sales_section=sales_section_filter.upper())
+
+        batch_id = self.request.query_params.get('batch')
+        if batch_id:
+            qs = qs.filter(batch_id=batch_id)
+        
+        unassigned = self.request.query_params.get('unassigned')
+        if unassigned == 'true' and user.role not in ['SALES']:
+            qs = qs.filter(batch__isnull=True)
+            
+        assigned_to = self.request.query_params.get('assigned_to')
+        if assigned_to:
+            if assigned_to == 'unassigned':
+                qs = qs.filter(assigned_to__isnull=True)
+            elif assigned_to == 'assigned':
+                qs = qs.filter(assigned_to__isnull=False)
+            else:
+                qs = qs.filter(assigned_to_id=assigned_to)
+
+        contacted = self.request.query_params.get('contacted')
+        if contacted in ('true', 'false'):
+            from crm.utils import get_converted_stage_values, get_dropped_stage_values
+            open_qs = qs.exclude(lead_status__in=get_converted_stage_values()).exclude(lead_status__in=get_dropped_stage_values())
+            contacted_ids = (
+                open_qs
+                .filter(crm_interactions__isnull=False)
+                .values('id')
+            )
+            if contacted == 'true':
+                qs = open_qs.filter(id__in=contacted_ids)
+            else:
+                qs = open_qs.exclude(id__in=contacted_ids)
+
+        fresh = self.request.query_params.get('fresh')
+        if fresh == 'true':
+            from crm.utils import get_new_stage_values
+            qs = qs.filter(lead_status__in=get_new_stage_values())
+
+        has_pending_tasks = self.request.query_params.get('has_pending_tasks')
+        if has_pending_tasks == 'true':
+            from crm.utils import get_converted_stage_values, get_dropped_stage_values
+            from crm.models import Task
+            pending_lead_ids = Task.objects.filter(status='PENDING', student__isnull=False).values_list('student_id', flat=True).distinct()
+            qs = qs.exclude(lead_status__in=get_converted_stage_values()).exclude(lead_status__in=get_dropped_stage_values()).filter(id__in=pending_lead_ids)
+            
+        new_only = self.request.query_params.get('new_only')
+        pipeline_only = self.request.query_params.get('pipeline_only')
+        if new_only == 'true' or pipeline_only == 'true':
+            new_stage_identifiers = ['NEW', 'New Lead', 'new']
+            try:
+                from crm.models import PipelineStage
+                first_stages = PipelineStage.objects.filter(Q(name__icontains='new') | Q(order=1)).values_list('id', flat=True)
+                for sid in first_stages:
+                    new_stage_identifiers.append(str(sid))
+            except Exception:
+                pass
+            
+            if new_only == 'true':
+                from django.db.models import Q
+                qs = qs.filter(Q(lead_status__in=new_stage_identifiers) | Q(lead_status__iexact='NEW') | Q(lead_status__iexact='New Lead'))
+            elif pipeline_only == 'true':
+                from django.db.models import Q
+                qs = qs.exclude(Q(lead_status__in=new_stage_identifiers) | Q(lead_status__iexact='NEW') | Q(lead_status__iexact='New Lead'))
+            
+        assigned_only = self.request.query_params.get('assigned_only')
+        if assigned_only == 'true':
+            qs = qs.filter(assigned_to=user)
+            
+        upcoming_followups = self.request.query_params.get('upcoming_followups')
+        if upcoming_followups == 'true':
+            from django.utils import timezone
+            from crm.models import Task
+            # Students that have an open follow-up task with a due_date in the future
+            student_ids_with_followup = Task.objects.filter(
+                due_date__gte=timezone.now(),
+                status__in=['PENDING', 'IN_PROGRESS', 'TODO'],
+            ).values_list('student_id', flat=True).distinct()
+            qs = qs.filter(id__in=student_ids_with_followup)
+            
+        program = self.request.query_params.get('program')
+        if program:
+            qs = qs.filter(program_type_id=program)
+
+        teacher_id = self.request.query_params.get('teacher_id')
+        if teacher_id:
+            qs = qs.filter(batch__teacher_id=teacher_id)
+
+        fee_status = self.request.query_params.get('fee_status')
+        if fee_status:
+            if fee_status.upper() == 'PAID':
+                qs = qs.filter(paid_fee__gte=F('total_fee'), total_fee__gt=0)
+            elif fee_status.upper() == 'PARTIAL':
+                qs = qs.filter(paid_fee__gt=0, paid_fee__lt=F('total_fee'))
+            elif fee_status.upper() == 'DEFAULTER':
+                qs = qs.filter(paid_fee__lt=F('total_fee'))
+            elif fee_status.upper() == 'MONTHLY_UNPAID':
+                from datetime import date
+                current_month = date.today().strftime('%Y-%m-01')
+                qs = qs.exclude(monthly_payment_months__contains=current_month)
+
+        mentor_id = self.request.query_params.get('mentor_id')
+
+        if mentor_id:
+            if user.role in ['SUPER_ADMIN', 'ADMIN', 'ACADEMIC', 'ACADEMIC_COORDINATOR']:
+                qs = qs.filter(batch__primary_mentor_id=mentor_id)
+            elif user.role in ['MENTOR', 'TEACHER'] and hasattr(user, 'get_all_subordinates'):
+                subordinates = user.get_all_subordinates()
+                if str(mentor_id) == str(user.id) or any(str(sub.id) == str(mentor_id) for sub in subordinates):
+                    qs = qs.filter(batch__primary_mentor_id=mentor_id)
+
+        lead_status = self.request.query_params.get('lead_status')
+        if lead_status:
+            if lead_status.upper() == 'DUPLICATE':
+                pass  # Already isolated above
+            else:
+                from crm.utils import resolve_stage_filter_values
+                resolved_values = resolve_stage_filter_values(lead_status)
+                if resolved_values:
+                    qs = qs.filter(lead_status__in=resolved_values)
+                else:
+                    qs = qs.filter(lead_status__iexact=lead_status)
+
+        sub_program = self.request.query_params.get('sub_program')
+        if sub_program:
+            qs = qs.filter(sub_program_id=sub_program)
+
+        batch = self.request.query_params.get('batch')
+        if batch:
+            qs = qs.filter(batch_id=batch)
+
+        course = self.request.query_params.get('course')
+        if course:
+            from django.db.models import Q
+            if str(course).isdigit():
+                qs = qs.filter(Q(course_id=int(course)) | Q(lms_course_id=course) | Q(lms_course_names__icontains=str(course)))
+            else:
+                qs = qs.filter(Q(course__name__icontains=str(course)) | Q(lms_course_id=course) | Q(lms_course_names__icontains=str(course)))
+
+        academic_status = self.request.query_params.get('academic_status')
+        if academic_status:
+            if academic_status.upper() == 'AVAILABLE':
+                qs = qs.filter(
+                    dynamic_values__field__field_group='ACADEMIC'
+                ).exclude(dynamic_values__value='').exclude(dynamic_values__value__isnull=True).distinct()
+            elif academic_status.upper() == 'WANTED':
+                # Filter to students who do NOT have any matching ACADEMIC values
+                # We can do this by excluding students who do have them
+                filled_ids = Student.objects.filter(
+                    dynamic_values__field__field_group='ACADEMIC'
+                ).exclude(dynamic_values__value='').exclude(dynamic_values__value__isnull=True).values_list('id', flat=True)
+                qs = qs.exclude(id__in=filled_ids)
+            else:
+                qs = qs.filter(academic_status=academic_status)
+
+        status_category = self.request.query_params.get('status_category')
+        if status_category:
+            from django.db.models import Q
+            from django.utils import timezone
+            from datetime import timedelta
+            sc = status_category.upper()
+            if sc == 'ACTIVE':
+                qs = qs.filter(academic_status='ACTIVE', is_active=True)
+            elif sc == 'INACTIVE':
+                qs = qs.filter(Q(academic_status__in=['ON_BREAK', 'DISCONTINUED']) | Q(is_active=False))
+            elif sc == 'NEW_ADMISSION':
+                thirty_days_ago = timezone.now() - timedelta(days=30)
+                qs = qs.filter(user__date_joined__gte=thirty_days_ago)
+
+        campaign_only = self.request.query_params.get('campaign_only')
+        if campaign_only == 'true':
+            qs = qs.filter(campaign__isnull=False)
+
+        campaign_id = self.request.query_params.get('campaign_id')
+        if campaign_id:
+            try:
+                qs = qs.filter(campaign__id=int(campaign_id))
+            except (ValueError, TypeError):
+                qs = qs.none()
+
+        sales_section = self.request.query_params.get('sales_section')
+        if sales_section and sales_section.upper() != 'ALL':
+            qs = qs.filter(
+                Q(sales_section=sales_section) |
+                Q(campaign__section=sales_section) |
+                Q(assigned_to__sales_section=sales_section)
+            )
+
+        date_preset = self.request.query_params.get('date_preset')
+        start_date_str = self.request.query_params.get('start_date')
+        end_date_str = self.request.query_params.get('end_date')
+
+        if date_preset and not (start_date_str and end_date_str):
+            from crm.utils import resolve_date_preset
+            preset_start, preset_end = resolve_date_preset(date_preset, start_date_str, end_date_str)
+            if not start_date_str and preset_start:
+                start_date_str = preset_start
+            if not end_date_str and preset_end:
+                end_date_str = preset_end
+
+        from django.utils.dateparse import parse_date
+        parsed_start = parse_date(start_date_str) if start_date_str else None
+        parsed_end = parse_date(end_date_str) if end_date_str else None
+
+        if parsed_start and parsed_end:
+            qs = qs.filter(
+                Q(created_at__date__gte=parsed_start, created_at__date__lte=parsed_end) |
+                Q(created_at__isnull=True, user__date_joined__date__gte=parsed_start, user__date_joined__date__lte=parsed_end)
+            )
+        elif parsed_start:
+            qs = qs.filter(
+                Q(created_at__date__gte=parsed_start) |
+                Q(created_at__isnull=True, user__date_joined__date__gte=parsed_start)
+            )
+        elif parsed_end:
+            qs = qs.filter(
+                Q(created_at__date__lte=parsed_end) |
+                Q(created_at__isnull=True, user__date_joined__date__lte=parsed_end)
+            )
+
+        if not self.request.query_params.get('ordering'):
+            return qs.order_by('-id')
+        return qs
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        
+        # Calculate full queryset stats before pagination
+        total_count = queryset.count()
+        # Query matching database profiles with academic details filled
+        # We check if student has any related values belonging to 'ACADEMIC' field group
+        available_count = queryset.filter(
+            dynamic_values__field__field_group='ACADEMIC'
+        ).exclude(dynamic_values__value='').exclude(dynamic_values__value__isnull=True).distinct().count()
+        wanted_count = max(0, total_count - available_count)
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            response = self.get_paginated_response(serializer.data)
+            # Inject stats into the paginated response object
+            response.data['academic_total'] = total_count
+            response.data['academic_available'] = available_count
+            response.data['academic_wanted'] = wanted_count
+            return response
+
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        user_role = str(user.role).upper().strip() if hasattr(user, 'role') else 'STUDENT'
+        if user_role != 'SUPER_ADMIN' and not user.is_superuser:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Only Super Admins can delete leads.")
+            
+        instance.is_active = False
+        instance.save()
+
+    @action(detail=False, methods=['get'])
+    def export_csv(self, request):
+        qs = self.filter_queryset(self.get_queryset())
+        data = []
+        for s in qs:
+            total_paid = s.transactions.aggregate(total=Sum('amount'))['total'] or 0
+            
+            # Map dynamic values list to a dictionary for simple lookup
+            dyn_values = {val.field.label: val.value for val in s.dynamic_values.all()}
+            
+            row = {
+                'CRM Student ID': s.crm_student_id,
+                'First Name': s.first_name,
+                'Last Name': s.last_name,
+                'Mobile': s.mobile,
+                'Email': s.email,
+                'Program': s.program_type.name if s.program_type else 'N/A',
+                'Sub Program': s.sub_program.name if s.sub_program else 'N/A',
+                'Course': s.course.name if s.course else 'N/A',
+                'Batch': s.batch.name if s.batch else 'N/A',
+                'Lead Status': s.lead_status,
+                'Academic Status': s.academic_status,
+                'Assigned To': f"{s.assigned_to.first_name} {s.assigned_to.last_name}".strip() or s.assigned_to.username if s.assigned_to else 'Unassigned',
+                'Campaign': s.campaign.name if s.campaign else 'N/A',
+                'Father/Husband Name': s.father_husband_name or '',
+                'Mother Name': s.mother_name or '',
+                'Date of Birth': s.dob or '',
+                'Gender': s.gender or '',
+                'Marital Status': s.marital_status or '',
+                'Permanent Address': s.perm_address or '',
+                'Correspondence Address': s.corr_address or '',
+                'Total Paid (CRM)': total_paid,
+                'Total Fee (Synced)': s.total_fee,
+                'Paid Fee (Synced)': s.paid_fee,
+                'Fee Due Date': s.fee_due_date or '',
+                'Monthly Payments (Paid Months)': ", ".join([p.month.strftime('%Y-%m-%d') for p in s.monthly_payments.all()]),
+            }
+            
+            # Add dynamic field values as additional columns
+            for label, value in dyn_values.items():
+                row[label] = value
+                
+            data.append(row)
+            
+        if data:
+            df = pd.DataFrame(data)
+        else:
+            # Empty fallback dataframe with basic headers
+            df = pd.DataFrame(columns=[
+                'CRM Student ID', 'First Name', 'Last Name', 'Mobile', 'Email', 
+                'Program', 'Sub Program', 'Course', 'Batch', 'Lead Status', 
+                'Academic Status', 'Assigned To', 'Campaign', 'Father/Husband Name', 
+                'Mother Name', 'Date of Birth', 'Gender', 'Marital Status', 
+                'Permanent Address', 'Correspondence Address', 'Total Paid (CRM)', 
+                'Total Fee (Synced)', 'Paid Fee (Synced)', 'Fee Due Date', 'Monthly Payments (Paid Months)'
+            ])
+            
+        response = HttpResponse(content_type='text/csv')
+        response['Content-Disposition'] = 'attachment; filename="students.csv"'
+        df.to_csv(path_or_buf=response, index=False)
+        return response
+
+    @action(detail=False, methods=['get'])
+    def export_leads_csv(self, request):
+        """Export ALL filtered leads (no pagination) with required CRM columns + latest note."""
+        from crm.models import PipelineStage, LeadInteraction
+        import csv
+
+        # Reuse the same queryset filtering logic (get_queryset handles filters via query_params)
+        qs = self.filter_queryset(self.get_queryset())
+
+        # Build a dynamic stage name map
+        stage_map = {str(s.id): s.name for s in PipelineStage.objects.all()}
+        standard_map = {
+            'NEW': 'New Lead',
+            'FOLLOW_UP': 'Follow-up',
+            'PAYMENT_PENDING': 'Payment Pending',
+            'ENROLLED': 'Enrolled',
+            'DROPPED': 'Dropped',
+            'CONVERTED': 'Converted',
+            'DUPLICATE': 'Duplicate',
+        }
+
+        response = HttpResponse(content_type='text/csv; charset=utf-8')
+        response['Content-Disposition'] = f'attachment; filename="Leads_Export_{timezone.now().strftime("%Y-%m-%d")}.csv"'
+        # Write UTF-8 BOM so Excel opens it correctly
+        response.write('\ufeff')
+
+        writer = csv.writer(response)
+        writer.writerow(['Lead ID', 'Lead Name', 'Mobile', 'Email', 'Assigned To', 'Status', 'Date Created', 'Campaign', 'Note'])
+
+        for s in qs.select_related('assigned_to', 'campaign').prefetch_related('crm_interactions'):
+            # Resolve status name
+            status_raw = str(s.lead_status or '')
+            status_name = standard_map.get(status_raw) or stage_map.get(status_raw) or status_raw or 'New Lead'
+
+            assigned_name = ''
+            if s.assigned_to:
+                assigned_name = f"{s.assigned_to.first_name} {s.assigned_to.last_name}".strip() or s.assigned_to.username
+
+            campaign_name = s.campaign.name if s.campaign else ''
+
+            # Latest note from crm_interactions
+            latest_interaction = s.crm_interactions.order_by('-date').first()
+            note_text = latest_interaction.notes if latest_interaction and latest_interaction.notes else ''
+
+            writer.writerow([
+                s.crm_student_id or s.id,
+                f"{s.first_name or ''} {s.last_name or ''}".strip(),
+                s.mobile or '',
+                s.email or '',
+                assigned_name,
+                status_name,
+                s.created_at.strftime('%d/%m/%Y') if s.created_at else '',
+                campaign_name,
+                note_text,
+            ])
+
+        return response
+
+
+    @action(detail=False, methods=['get'])
+    def due_students(self, request):
+        students = self.get_queryset().filter(course__isnull=False)
+        due_list = []
+        for s in students:
+            total_paid = s.transactions.aggregate(total=Sum('amount'))['total'] or 0
+            fee = s.course.fee_amount
+            if total_paid < fee:
+                due_list.append(s)
+        serializer = self.get_serializer(due_list, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
+    def restore(self, request, pk=None):
+        student = self.get_object()
+        student.is_active = True
+        student.save()
+        return Response({'status': 'student restored'})
+
+    @action(detail=True, methods=['post'])
+    def set_credentials(self, request, pk=None):
+        student = self.get_object()
+        user = student.user
+        username = request.data.get('username')
+        password = request.data.get('password')
+        
+        if not username or not password:
+            return Response({'error': 'Username and password are required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        if request.user.role == 'MENTOR':
+            if not student.batch or (student.batch.primary_mentor != request.user and not student.batch.secondary_mentors.filter(id=request.user.id).exists()):
+                 return Response({'error': 'Permission denied: You do not mentor this student'}, status=status.HTTP_403_FORBIDDEN)
+
+        User = get_user_model()
+        if User.objects.filter(username=username).exclude(id=user.id).exists():
+            return Response({'error': 'Username already taken'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        user.username = username
+        user.set_password(password)
+        user.role = 'STUDENT'
+        user.is_active = True
+        user.save()
+        
+        return Response({'status': 'Credentials updated successfully'})
+
+    @action(detail=True, methods=['post'])
+    def permanent_delete(self, request, pk=None):
+        student = self.get_object()
+        student.delete()
+        return Response({'status': 'student permanently deleted'})
+
+    @action(detail=True, methods=['post'])
+    def record_payment(self, request, pk=None):
+        student = self.get_object()
+        amount = request.data.get('amount')
+        paid_date = request.data.get('paid_date')
+        notes = request.data.get('notes', '')
+        month_str = request.data.get('month')
+
+        if not amount:
+            return Response({'error': 'Payment amount is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            amount_dec = Decimal(str(amount))
+        except (InvalidOperation, TypeError, ValueError):
+            return Response({'error': 'Invalid amount format'}, status=status.HTTP_400_BAD_REQUEST)
+
+        student.paid_fee = (student.paid_fee or Decimal('0.00')) + amount_dec
+        student.save(update_fields=['paid_fee'])
+
+        import uuid
+        Transaction.objects.create(
+            student=student,
+            transaction_id=f"TXN-{uuid.uuid4().hex[:8].upper()}",
+            amount=amount_dec,
+        )
+
+        from datetime import datetime, date
+        if month_str:
+            try:
+                m_date = datetime.strptime(month_str[:7] + "-01", "%Y-%m-%d").date()
+            except ValueError:
+                m_date = date.today().replace(day=1)
+        else:
+            m_date = date.today().replace(day=1)
+
+        monthly_pay, created = MonthlyPayment.objects.get_or_create(
+            student=student,
+            month=m_date,
+            defaults={
+                'amount': amount_dec,
+                'paid_date': paid_date if paid_date else date.today(),
+                'marked_by': request.user if request.user.is_authenticated else None,
+                'notes': notes
+            }
+        )
+        if not created:
+            monthly_pay.amount += amount_dec
+            if notes:
+                monthly_pay.notes = f"{monthly_pay.notes}\n{notes}".strip()
+            monthly_pay.save()
+
+        # Log the payment addition
+        from .models import FeeEditLog
+        FeeEditLog.objects.create(
+            student=student,
+            action='PAYMENT_ADD',
+            field_name='monthly_payment',
+            old_value=None,
+            new_value=f"Month: {m_date.strftime('%B %Y')}, Amount: {amount_dec}",
+            notes=notes if notes else None,
+            edited_by=request.user if request.user.is_authenticated else None
+        )
+
+        serializer = self.get_serializer(student)
+        return Response({'status': 'Payment recorded successfully', 'student': serializer.data})
+
+    @action(detail=True, methods=['post', 'patch'])
+    def update_fee(self, request, pk=None):
+        student = self.get_object()
+        total_fee = request.data.get('total_fee')
+        fee_due_date = request.data.get('fee_due_date')
+        from .models import FeeEditLog
+
+        if total_fee is not None:
+            try:
+                new_fee = Decimal(str(total_fee))
+                old_fee = student.total_fee
+                if new_fee != old_fee:
+                    FeeEditLog.objects.create(
+                        student=student,
+                        action='FEE_UPDATE',
+                        field_name='total_fee',
+                        old_value=str(old_fee),
+                        new_value=str(new_fee),
+                        edited_by=request.user if request.user.is_authenticated else None
+                    )
+                student.total_fee = new_fee
+            except (InvalidOperation, TypeError, ValueError):
+                return Response({'error': 'Invalid total fee format'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if fee_due_date is not None:
+            old_due = str(student.fee_due_date) if student.fee_due_date else ''
+            new_due = fee_due_date if fee_due_date != '' else None
+            if str(old_due) != str(new_due or ''):
+                FeeEditLog.objects.create(
+                    student=student,
+                    action='FEE_UPDATE',
+                    field_name='fee_due_date',
+                    old_value=old_due,
+                    new_value=str(new_due) if new_due else '',
+                    edited_by=request.user if request.user.is_authenticated else None
+                )
+            student.fee_due_date = new_due
+
+        student.save()
+        serializer = self.get_serializer(student)
+        return Response({'status': 'Fee details updated successfully', 'student': serializer.data})
+
+    @action(detail=True, methods=['get'])
+    def fee_logs(self, request, pk=None):
+        """Return all fee edit logs for a student"""
+        student = self.get_object()
+        from .models import FeeEditLog
+        logs = FeeEditLog.objects.filter(student=student).select_related('edited_by')
+        data = []
+        for log in logs:
+            editor = log.edited_by
+            data.append({
+                'id': log.id,
+                'action': log.get_action_display(),
+                'action_code': log.action,
+                'field_name': log.field_name,
+                'old_value': log.old_value,
+                'new_value': log.new_value,
+                'notes': log.notes,
+                'edited_by': editor.get_full_name() or editor.username if editor else 'System',
+                'created_at': log.created_at,
+            })
+        return Response(data)
+
+    @action(detail=True, methods=['get'])
+    def payment_records(self, request, pk=None):
+        """Return all monthly payment records for a student"""
+        student = self.get_object()
+        payments = student.monthly_payments.select_related('marked_by').order_by('-month')
+        data = []
+        for p in payments:
+            marker = p.marked_by
+            data.append({
+                'id': p.id,
+                'month': p.month,
+                'amount': str(p.amount),
+                'paid_date': p.paid_date,
+                'notes': p.notes,
+                'marked_by': marker.get_full_name() or marker.username if marker else 'Unknown',
+            })
+        return Response(data)
+
+    @action(detail=True, methods=['post'])
+    def edit_payment(self, request, pk=None):
+        """Edit an existing monthly payment record"""
+        student = self.get_object()
+        payment_id = request.data.get('payment_id')
+        new_amount = request.data.get('amount')
+        new_paid_date = request.data.get('paid_date')
+        new_notes = request.data.get('notes', '')
+
+        from .models import FeeEditLog
+        try:
+            payment = student.monthly_payments.get(id=payment_id)
+        except Exception:
+            return Response({'error': 'Payment record not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        changes = []
+        if new_amount is not None:
+            try:
+                new_amt = Decimal(str(new_amount))
+                if new_amt != payment.amount:
+                    changes.append(f"amount: {payment.amount} → {new_amt}")
+                    # Adjust student paid_fee
+                    diff = new_amt - payment.amount
+                    student.paid_fee = (student.paid_fee or Decimal('0.00')) + diff
+                    student.save(update_fields=['paid_fee'])
+                    payment.amount = new_amt
+            except (InvalidOperation, TypeError, ValueError):
+                return Response({'error': 'Invalid amount'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if new_paid_date:
+            payment.paid_date = new_paid_date
+        if new_notes is not None:
+            payment.notes = new_notes
+
+        payment.save()
+
+        if changes:
+            FeeEditLog.objects.create(
+                student=student,
+                action='PAYMENT_EDIT',
+                field_name='monthly_payment',
+                old_value='; '.join(changes).split('→')[0].strip(),
+                new_value='; '.join(changes).split('→')[-1].strip() if '→' in '; '.join(changes) else '',
+                notes=f"Month: {payment.month} | Changes: {'; '.join(changes)}",
+                edited_by=request.user if request.user.is_authenticated else None
+            )
+
+        serializer = self.get_serializer(student)
+        return Response({'status': 'Payment updated successfully', 'student': serializer.data})
+
+    @action(detail=True, methods=['post'])
+    def delete_payment(self, request, pk=None):
+        """Delete a monthly payment record"""
+        student = self.get_object()
+        payment_id = request.data.get('payment_id')
+
+        from .models import FeeEditLog
+        try:
+            payment = student.monthly_payments.get(id=payment_id)
+        except Exception:
+            return Response({'error': 'Payment record not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Reduce paid_fee
+        student.paid_fee = max(Decimal('0.00'), (student.paid_fee or Decimal('0.00')) - payment.amount)
+        student.save(update_fields=['paid_fee'])
+
+        FeeEditLog.objects.create(
+            student=student,
+            action='PAYMENT_DELETE',
+            field_name='monthly_payment',
+            old_value=f"Month: {payment.month}, Amount: {payment.amount}",
+            new_value='DELETED',
+            edited_by=request.user if request.user.is_authenticated else None
+        )
+
+        payment.delete()
+        serializer = self.get_serializer(student)
+        return Response({'status': 'Payment deleted successfully', 'student': serializer.data})
+
+    @action(detail=True, methods=['post'])
+    def handover_teacher(self, request, pk=None):
+        student = self.get_object()
+        new_teacher_id = request.data.get('new_teacher_id')
+        reason = request.data.get('reason', '')
+
+        if not new_teacher_id:
+            return Response({'error': 'New teacher ID is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        User = get_user_model()
+        try:
+            new_teacher = User.objects.get(id=new_teacher_id)
+        except User.DoesNotExist:
+            return Response({'error': 'Selected teacher does not exist'}, status=status.HTTP_404_NOT_FOUND)
+
+        previous_teacher = student.batch.teacher if student.batch else None
+
+        from .models import StudentTeacherHandover
+        StudentTeacherHandover.objects.create(
+            student=student,
+            previous_teacher=previous_teacher,
+            current_teacher=new_teacher,
+            reason=reason,
+            changed_by=request.user if request.user.is_authenticated else None
+        )
+
+        if student.batch:
+            student.batch.teacher = new_teacher
+            student.batch.save(update_fields=['teacher'])
+
+        serializer = self.get_serializer(student)
+        return Response({'status': 'Teacher handover completed successfully', 'student': serializer.data})
+
+
+    @action(detail=False, methods=['post'])
+    def bulk_assign(self, request):
+        student_ids = request.data.get('student_ids', [])
+        user_id = request.data.get('user_id')
+        
+        if not student_ids:
+            return Response({'error': 'No student IDs provided'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        # Secure bulk assignment: DUPLICATE leads can never be assigned or unassigned via bulk operations
+        students = Student.objects.filter(id__in=student_ids).exclude(lead_status__iexact='DUPLICATE')
+        
+        if user_id:
+            try:
+                assigned_user = get_user_model().objects.get(id=user_id)
+                students.update(assigned_to=assigned_user)
+                return Response({'status': f'Leads assigned to {assigned_user.first_name or assigned_user.username}'})
+            except get_user_model().DoesNotExist:
+                return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+        else:
+            # Unassign
+            students.update(assigned_to=None)
+            return Response({'status': 'Leads unassigned'})
+
+    @action(detail=True, methods=['post'])
+    def take_break(self, request, pk=None):
+        student = self.get_object()
+        reason = request.data.get('reason', '')
+        break_date = request.data.get('date')
+        
+        if student.academic_status == 'ON_BREAK':
+            return Response({'error': 'Student is already on break'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        student.academic_status = 'ON_BREAK'
+        student.save()
+        
+        from core.models import StudentBreakHistory
+        import datetime
+        
+        try:
+            break_date_obj = datetime.date.fromisoformat(break_date) if break_date else datetime.date.today()
+        except ValueError:
+            break_date_obj = datetime.date.today()
+
+        StudentBreakHistory.objects.create(
+            student=student,
+            break_start_date=break_date_obj,
+            reason=reason,
+            is_active_break=True
+        )
+        return Response({'status': 'Student placed on break'})
+
+    @action(detail=True, methods=['post'])
+    def rejoin(self, request, pk=None):
+        student = self.get_object()
+        rejoin_date = request.data.get('date')
+        
+        if student.academic_status != 'ON_BREAK':
+            return Response({'error': 'Student is not currently on break'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        student.academic_status = 'ACTIVE'
+        student.save()
+        
+        from core.models import StudentBreakHistory
+        import datetime
+        
+        try:
+            rejoin_date_obj = datetime.date.fromisoformat(rejoin_date) if rejoin_date else datetime.date.today()
+        except ValueError:
+            rejoin_date_obj = datetime.date.today()
+
+        active_break = StudentBreakHistory.objects.filter(student=student, is_active_break=True).first()
+        if active_break:
+            active_break.is_active_break = False
+            active_break.rejoin_date = rejoin_date_obj
+            active_break.save()
+            
+        return Response({'status': 'Student rejoined successfully'})
+
+    @action(detail=True, methods=['post'])
+    def discontinue(self, request, pk=None):
+        student = self.get_object()
+        reason = request.data.get('reason', '')
+        discontinue_date = request.data.get('date')
+        
+        if student.academic_status == 'DISCONTINUED':
+            return Response({'error': 'Student is already discontinued'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        student.academic_status = 'DISCONTINUED'
+        # Optional: You might want to update lead_status to 'DROPPED' as well
+        # student.lead_status = 'DROPPED'
+        
+        import datetime
+        try:
+            discontinue_date_obj = datetime.date.fromisoformat(discontinue_date) if discontinue_date else datetime.date.today()
+        except ValueError:
+            discontinue_date_obj = datetime.date.today()
+            
+        student.discontinued_date = discontinue_date_obj
+        student.save()
+        
+        # We can also save the reason in a log/history if we want, but for now we just change status.
+        return Response({'status': 'Student marked as discontinued'})
+
+    @action(detail=False, methods=['get'])
+    def break_metrics(self, request):
+        from core.models import StudentBreakHistory
+        from datetime import datetime, date
+
+        def parse(d):
+            try:
+                return datetime.strptime(d, '%Y-%m-%d').date() if d else None
+            except ValueError:
+                return None
+
+        start_date = parse(request.query_params.get('start_date'))
+        end_date = parse(request.query_params.get('end_date'))
+
+        qs = self.get_queryset()
+
+        on_break_students = qs.filter(academic_status='ON_BREAK')
+        discontinued_qs = qs.filter(academic_status='DISCONTINUED')
+
+        break_history_qs = StudentBreakHistory.objects.filter(
+            student__in=on_break_students, is_active_break=True
+        ).select_related('student')
+
+        rejoined_qs = StudentBreakHistory.objects.filter(
+            student__in=qs.filter(academic_status='ACTIVE'),   # excludes DISCONTINUED and ON_BREAK
+            is_active_break=False,
+        ).select_related('student').order_by('student_id', '-rejoin_date')
+
+        if start_date:
+            break_history_qs = break_history_qs.filter(break_start_date__gte=start_date)
+            rejoined_qs = rejoined_qs.filter(rejoin_date__gte=start_date)
+            discontinued_qs = discontinued_qs.filter(discontinued_date__gte=start_date)
+        if end_date:
+            break_history_qs = break_history_qs.filter(break_start_date__lte=end_date)
+            rejoined_qs = rejoined_qs.filter(rejoin_date__lte=end_date)
+            discontinued_qs = discontinued_qs.filter(discontinued_date__lte=end_date)
+
+        if not start_date and not end_date:
+            today = date.today()
+            rejoined_qs = rejoined_qs.filter(
+                rejoin_date__year=today.year, rejoin_date__month=today.month
+            )
+
+        on_break_data = []
+        for h in break_history_qs:
+            s = h.student
+            on_break_data.append({
+                'id': s.id,
+                'name': f"{s.first_name} {s.last_name}",
+                'crm_student_id': s.crm_student_id,
+                'mobile': s.mobile,
+                'email': s.email,
+                'reason': h.reason,
+                'date': h.break_start_date.strftime('%Y-%m-%d') if h.break_start_date else ''
+            })
+
+        rejoined_data = []
+        seen = set()
+        for h in rejoined_qs:
+            if h.student_id in seen:
+                continue
+            seen.add(h.student_id)
+            s = h.student
+            rejoined_data.append({
+                'id': s.id,
+                'name': f"{s.first_name} {s.last_name}",
+                'crm_student_id': s.crm_student_id,
+                'mobile': s.mobile,
+                'email': s.email,
+                'reason': h.reason,
+                'break_date': h.break_start_date.strftime('%Y-%m-%d') if h.break_start_date else '',
+                'rejoin_date': h.rejoin_date.strftime('%Y-%m-%d') if h.rejoin_date else ''
+            })
+
+        discontinued_data = []
+        for s in discontinued_qs:
+            discontinued_data.append({
+                'id': s.id,
+                'name': f"{s.first_name} {s.last_name}",
+                'crm_student_id': s.crm_student_id,
+                'mobile': s.mobile,
+                'email': s.email,
+                'reason': 'Discontinued',
+                'date': s.discontinued_date.strftime('%Y-%m-%d') if s.discontinued_date else ''
+            })
+
+        return Response({
+            'on_break': on_break_data,
+            'rejoined': rejoined_data,
+            'discontinued': discontinued_data,
+            'on_break_count': len(on_break_data),
+            'rejoined_count': len(rejoined_data),
+            'discontinued_count': len(discontinued_data)
+        })
+
+    @action(detail=False, methods=['get'])
+    def fee_defaulters(self, request):
+        from django.db.models import F
+        # Students where paid_fee < total_fee
+        qs = self.get_queryset().filter(paid_fee__lt=F('total_fee'))
+        
+        # Support optional date range filtering on fee_due_date
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        if start_date:
+            qs = qs.filter(fee_due_date__gte=start_date)
+        if end_date:
+            qs = qs.filter(fee_due_date__lte=end_date)
+        
+        data = []
+        for s in qs:
+            mentor_name = 'Not Assigned'
+            if s.batch and s.batch.primary_mentor:
+                mentor_name = f"{s.batch.primary_mentor.first_name} {s.batch.primary_mentor.last_name}".strip() or s.batch.primary_mentor.username
+                
+            data.append({
+                'id': s.id,
+                'name': f"{s.first_name} {s.last_name}",
+                'crm_student_id': s.crm_student_id,
+                'mobile': s.mobile,
+                'email': s.email,
+                'total_fee': s.total_fee,
+                'paid_fee': s.paid_fee,
+                'due_amount': s.total_fee - s.paid_fee,
+                'fee_due_date': s.fee_due_date.strftime('%Y-%m-%d') if s.fee_due_date else '',
+                'is_wise_integrated': bool(s.lms_student_id),
+                'batch_name': s.batch.name if s.batch else 'Unassigned',
+                'mentor_name': mentor_name
+            })
+            
+        return Response(data)
+
+    @action(detail=True, methods=['post'])
+    def record_payment(self, request, pk=None):
+        student = self.get_object()
+        amount_raw = request.data.get('amount')
+        payment_mode = request.data.get('payment_mode', 'CASH')
+        transaction_id = request.data.get('transaction_id')
+        notes = request.data.get('notes', '')
+        due_date_str = request.data.get('fee_due_date')
+
+        try:
+            amount = Decimal(str(amount_raw))
+            if amount <= 0:
+                return Response({'error': 'Payment amount must be greater than zero.'}, status=status.HTTP_400_BAD_REQUEST)
+        except (TypeError, ValueError, InvalidOperation):
+            return Response({'error': 'Invalid payment amount.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not transaction_id:
+            import time
+            transaction_id = f"PAY-{int(time.time())}"
+
+        txn = Transaction.objects.create(
+            student=student,
+            transaction_id=transaction_id,
+            amount=amount
+        )
+
+        student.paid_fee = (student.paid_fee or Decimal('0.00')) + amount
+
+        if due_date_str:
+            if due_date_str == '' or due_date_str == 'null':
+                student.fee_due_date = None
+            else:
+                from django.utils.dateparse import parse_date
+                parsed_date = parse_date(due_date_str)
+                if parsed_date:
+                    student.fee_due_date = parsed_date
+
+        student.save()
+
+        serializer = self.get_serializer(student)
+        return Response({
+            'status': 'Payment recorded successfully',
+            'student': serializer.data,
+            'transaction': {
+                'id': txn.id,
+                'transaction_id': txn.transaction_id,
+                'amount': float(txn.amount),
+                'date': txn.date.isoformat() if txn.date else None
+            }
+        })
+
+    @action(detail=True, methods=['post', 'patch'])
+    def update_fee_details(self, request, pk=None):
+        student = self.get_object()
+        total_fee = request.data.get('total_fee')
+        paid_fee = request.data.get('paid_fee')
+        fee_due_date = request.data.get('fee_due_date')
+
+        if total_fee is not None:
+            try:
+                student.total_fee = Decimal(str(total_fee))
+            except (TypeError, ValueError, InvalidOperation):
+                return Response({'error': 'Invalid total fee amount.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if paid_fee is not None:
+            try:
+                student.paid_fee = Decimal(str(paid_fee))
+            except (TypeError, ValueError, InvalidOperation):
+                return Response({'error': 'Invalid paid fee amount.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if fee_due_date is not None:
+            if fee_due_date == '' or fee_due_date == 'null':
+                student.fee_due_date = None
+            else:
+                from django.utils.dateparse import parse_date
+                parsed_date = parse_date(fee_due_date)
+                if parsed_date:
+                    student.fee_due_date = parsed_date
+
+        student.save()
+        serializer = self.get_serializer(student)
+        return Response({
+            'status': 'Fee details updated successfully',
+            'student': serializer.data
+        })
+
+    @action(detail=False, methods=['get'])
+    def collected_fees(self, request):
+        from django.db.models import Q
+        from core.models import Transaction, MonthlyPayment, Student
+        from integrations.utils import WiseService
+        user = request.user
+        
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        
+        # Default to current month if no dates are provided
+        if not start_date or start_date == '':
+            import datetime
+            start_date = datetime.date.today().replace(day=1).strftime('%Y-%m-%d')
+        if not end_date or end_date == '':
+            import datetime
+            end_date = datetime.date.today().strftime('%Y-%m-%d')
+        
+        # 1. Query Transactions
+        tx_qs = Transaction.objects.all().select_related('student', 'student__batch', 'student__batch__primary_mentor')
+        if user.role in ['MENTOR', 'TEACHER']:
+            tx_qs = tx_qs.filter(
+                Q(student__batch__primary_mentor=user) | 
+                Q(student__batch__secondary_mentors=user) | 
+                Q(student__batch__teacher=user)
+            ).distinct()
+            
+        if start_date:
+            tx_qs = tx_qs.filter(date__date__gte=start_date)
+        if end_date:
+            tx_qs = tx_qs.filter(date__date__lte=end_date)
+            
+        # 2. Query MonthlyPayments
+        mp_qs = MonthlyPayment.objects.all().select_related('student', 'student__batch', 'student__batch__primary_mentor')
+        if user.role in ['MENTOR', 'TEACHER']:
+            mp_qs = mp_qs.filter(
+                Q(student__batch__primary_mentor=user) | 
+                Q(student__batch__secondary_mentors=user) | 
+                Q(student__batch__teacher=user)
+            ).distinct()
+            
+        if start_date:
+            mp_qs = mp_qs.filter(paid_date__gte=start_date)
+        if end_date:
+            mp_qs = mp_qs.filter(paid_date__lte=end_date)
+            
+        # 3. Query Wise LMS Live Transactions
+        wise = WiseService()
+        wise_txs = []
+        try:
+            if wise.api_key:
+                wise_tx_data = wise.get_institute_transactions(start_date=start_date, end_date=end_date)
+                if wise_tx_data and isinstance(wise_tx_data, dict):
+                    wise_txs = wise_tx_data.get('transactions') or []
+        except Exception as e:
+            print(f"Error fetching live Wise transactions: {e}")
+
+        # Build list of scoped students for matching and role-based filtering
+        students_qs = Student.objects.all()
+        if user.role in ['MENTOR', 'TEACHER']:
+            students_qs = students_qs.filter(
+                Q(batch__primary_mentor=user) | 
+                Q(batch__secondary_mentors=user) | 
+                Q(batch__teacher=user)
+            ).distinct()
+            
+        lms_to_student = {}
+        for s in students_qs.select_related('batch', 'batch__primary_mentor'):
+            if s.lms_student_id:
+                lms_to_student[str(s.lms_student_id)] = s
+
+        # 4. Format & Merge
+        data = []
+        for t in tx_qs:
+            mentor_name = 'Not Assigned'
+            if t.student.batch and t.student.batch.primary_mentor:
+                mentor_name = f"{t.student.batch.primary_mentor.first_name} {t.student.batch.primary_mentor.last_name}".strip() or t.student.batch.primary_mentor.username
+                
+            data.append({
+                'id': f"tx_{t.id}",
+                'student_name': f"{t.student.first_name} {t.student.last_name}",
+                'crm_student_id': t.student.crm_student_id,
+                'batch_name': t.student.batch.name if t.student.batch else 'Unassigned',
+                'mentor_name': mentor_name,
+                'amount': float(t.amount),
+                'date': t.date.strftime('%Y-%m-%d'),
+                'type': 'LMS / Razorpay Sync',
+                'ref_id': t.transaction_id
+            })
+            
+        for p in mp_qs:
+            mentor_name = 'Not Assigned'
+            if p.student.batch and p.student.batch.primary_mentor:
+                mentor_name = f"{p.student.batch.primary_mentor.first_name} {p.student.batch.primary_mentor.last_name}".strip() or p.student.batch.primary_mentor.username
+                
+            data.append({
+                'id': f"mp_{p.id}",
+                'student_name': f"{p.student.first_name} {p.student.last_name}",
+                'crm_student_id': p.student.crm_student_id,
+                'batch_name': p.student.batch.name if p.student.batch else 'Unassigned',
+                'mentor_name': mentor_name,
+                'amount': float(p.amount),
+                'date': p.paid_date.strftime('%Y-%m-%d') if p.paid_date else '',
+                'type': f"Manual ({p.month.strftime('%b %Y')})",
+                'ref_id': p.notes or 'N/A'
+            })
+
+        for wtx in wise_txs:
+            w_student_id = str(wtx.get('studentId') or '')
+            
+            # Role-based filtering: if MENTOR/TEACHER, only show if student is in our scoped mapping
+            if user.role in ['MENTOR', 'TEACHER'] and w_student_id not in lms_to_student:
+                continue
+            
+            # Resolve student details
+            local_student = lms_to_student.get(w_student_id)
+            if local_student:
+                student_name = f"{local_student.first_name} {local_student.last_name}"
+                crm_student_id = local_student.crm_student_id
+                batch_name = local_student.batch.name if local_student.batch else 'Unassigned'
+                mentor_name = 'Not Assigned'
+                if local_student.batch and local_student.batch.primary_mentor:
+                    mentor_name = f"{local_student.batch.primary_mentor.first_name} {local_student.batch.primary_mentor.last_name}".strip() or local_student.batch.primary_mentor.username
+            else:
+                # Fallback to Wise API transaction data if we are an admin and student is not in CRM
+                student_name = wtx.get('student', {}).get('name') or 'Unknown Student'
+                crm_student_id = 'N/A'
+                batch_name = wtx.get('classroom', {}).get('name') or 'Wise Class'
+                mentor_name = 'Not Assigned'
+            
+            amount_obj = wtx.get('amount') or {}
+            if isinstance(amount_obj, dict):
+                amount_val = float(amount_obj.get('value', 0)) / 100.0
+            else:
+                amount_val = float(amount_obj) / 100.0
+                
+            # Format chargedAt
+            charged_at_str = wtx.get('chargedAt') or wtx.get('createdAt') or ''
+            formatted_date = ''
+            if charged_at_str:
+                try:
+                    formatted_date = charged_at_str.split('T')[0]
+                except Exception:
+                    formatted_date = charged_at_str
+                    
+            data.append({
+                'id': f"wise_{wtx.get('_id') or wtx.get('id')}",
+                'student_name': student_name,
+                'crm_student_id': crm_student_id,
+                'batch_name': batch_name,
+                'mentor_name': mentor_name,
+                'amount': amount_val,
+                'date': formatted_date,
+                'type': 'Wise LMS Sync',
+                'ref_id': wtx.get('_id') or wtx.get('id') or 'N/A'
+            })
+            
+        # Sort by date descending
+        data.sort(key=lambda x: x.get('date') or '', reverse=True)
+        return Response(data)
+
+    @action(detail=True, methods=['post'])
+    def mark_as_paid(self, request, pk=None):
+        student = self.get_object()
+        
+        if student.lms_student_id:
+            return Response({'error': 'Cannot manually mark Wise LMS integrated student as paid. Please sync from Wise LMS instead.'}, status=400)
+            
+        student.paid_fee = student.total_fee
+        if student.lead_status == 'PAYMENT_PENDING' or str(student.lead_status).upper() in ['PAYMENT_PENDING', '3']:
+            from crm.utils import get_canonical_converted_stage_id
+            student.lead_status = get_canonical_converted_stage_id()
+        student.save()
+        
+        return Response({'status': 'Student marked as fully paid'})
+
+    @action(detail=True, methods=['post'], url_path='mark-paid')
+    def mark_paid(self, request, pk=None):
+        student = self.get_object()
+        month_str = request.data.get('month') # expected format YYYY-MM-DD (first day of the month)
+        amount_val = request.data.get('amount')
+        notes = request.data.get('notes', '')
+
+        if not month_str:
+            return Response({'error': 'month is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from django.utils.dateparse import parse_date
+        month_date = parse_date(month_str)
+        if not month_date:
+            return Response({'error': 'Invalid date format'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Force it to be the first of the month
+        month_date = month_date.replace(day=1)
+
+        # Determine payment amount
+        if amount_val is not None:
+            try:
+                amount = float(amount_val)
+            except ValueError:
+                return Response({'error': 'Invalid amount'}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            # Fallback to student's course fee or total_fee
+            if student.course:
+                amount = float(student.course.fee_amount)
+            else:
+                amount = float(student.total_fee)
+
+        number_of_months_val = request.data.get('number_of_months', 1)
+        try:
+            number_of_months = int(number_of_months_val)
+            if number_of_months < 1:
+                number_of_months = 1
+        except (ValueError, TypeError):
+            number_of_months = 1
+
+        from decimal import Decimal
+        amount_per_month = round(Decimal(str(amount)) / Decimal(str(number_of_months)), 2)
+
+        from core.models import MonthlyPayment
+        import datetime
+
+        created_payments = []
+        for i in range(number_of_months):
+            # Calculate target month date
+            m = month_date.month - 1 + i
+            y = month_date.year + m // 12
+            m = m % 12 + 1
+            target_month = datetime.date(y, m, 1)
+
+            payment, created = MonthlyPayment.objects.update_or_create(
+                student=student,
+                month=target_month,
+                defaults={
+                    'amount': amount_per_month,
+                    'marked_by': request.user,
+                    'notes': f"{notes} (Part of {number_of_months}-month payment)".strip() if number_of_months > 1 else notes
+                }
+            )
+            created_payments.append(target_month.strftime('%Y-%m-%d'))
+
+        return Response({
+            'status': 'Payment marked successfully',
+            'months': created_payments,
+            'amount_per_month': float(amount_per_month),
+            'total_amount': amount
+        })
+
+    @action(detail=True, methods=['post'], url_path='unmark-paid')
+    def unmark_paid(self, request, pk=None):
+        student = self.get_object()
+        month_str = request.data.get('month')
+
+        if not month_str:
+            return Response({'error': 'month is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from django.utils.dateparse import parse_date
+        month_date = parse_date(month_str)
+        if not month_date:
+            return Response({'error': 'Invalid date format'}, status=status.HTTP_400_BAD_REQUEST)
+
+        month_date = month_date.replace(day=1)
+
+        from core.models import MonthlyPayment
+        deleted_count, _ = MonthlyPayment.objects.filter(student=student, month=month_date).delete()
+
+        if deleted_count > 0:
+            return Response({'status': 'Payment unmarked successfully'})
+        else:
+            return Response({'error': 'No payment record found for this month'}, status=status.HTTP_404_NOT_FOUND)
+
+    @action(detail=True, methods=['get'], url_path='payment-history')
+    def payment_history(self, request, pk=None):
+        student = self.get_object()
+        from core.models import MonthlyPayment
+        payments = MonthlyPayment.objects.filter(student=student).order_by('-month')
+        
+        data = []
+        for p in payments:
+            data.append({
+                'id': p.id,
+                'month': p.month.strftime('%Y-%m-%d'),
+                'month_name': p.month.strftime('%B %Y'),
+                'amount': float(p.amount),
+                'paid_date': p.paid_date.strftime('%Y-%m-%d'),
+                'marked_by': p.marked_by.get_full_name() or p.marked_by.username if p.marked_by else 'System',
+                'notes': p.notes
+            })
+        return Response(data)
+
+    @action(detail=True, methods=['post'], url_path='record-payment')
+    def record_payment(self, request, pk=None):
+        student = self.get_object()
+        amount_val = request.data.get('amount')
+        if amount_val is None:
+            return Response({'error': 'amount is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            from decimal import Decimal
+            amount = Decimal(str(amount_val))
+            if amount <= 0:
+                return Response({'error': 'amount must be greater than 0'}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception:
+            return Response({'error': 'invalid amount format'}, status=status.HTTP_400_BAD_REQUEST)
+
+        import time
+        transaction_id = request.data.get('transaction_id') or f"TXN-{int(time.time())}"
+        transaction_link = request.data.get('transaction_link', '')
+        
+        from core.models import Transaction
+        txn = Transaction.objects.create(
+            student=student,
+            transaction_id=transaction_id,
+            amount=amount,
+            transaction_link=transaction_link
+        )
+        
+        student.paid_fee = (student.paid_fee or Decimal('0.00')) + amount
+        
+        due_date_str = request.data.get('fee_due_date')
+        if due_date_str:
+            from django.utils.dateparse import parse_date
+            parsed_date = parse_date(due_date_str)
+            if parsed_date:
+                student.fee_due_date = parsed_date
+                
+        student.save()
+
+        from crm.services.meta_capi import queue_meta_event
+
+        queue_meta_event(
+            student=student,
+            event_name="Purchase",
+            request=request,
+            action_source="other",
+            event_time=txn.date,
+            idempotency_key=f"purchase:transaction:{txn.pk}",
+            custom_data={
+                "value": float(txn.amount),
+                "currency": "INR",
+                "order_id": txn.transaction_id,
+            },
+        )
+        
+        serializer = self.get_serializer(student)
+        return Response({
+            'status': 'Payment recorded successfully',
+            'transaction_id': txn.transaction_id,
+            'amount': float(txn.amount),
+            'student': serializer.data
+        })
+
+    @action(detail=True, methods=['post', 'patch'], url_path='update-fee-details')
+    def update_fee_details(self, request, pk=None):
+        student = self.get_object()
+        total_fee = request.data.get('total_fee')
+        paid_fee = request.data.get('paid_fee')
+        fee_due_date = request.data.get('fee_due_date')
+        
+        from decimal import Decimal
+        if total_fee is not None:
+            try:
+                student.total_fee = Decimal(str(total_fee))
+            except Exception:
+                pass
+                
+        if paid_fee is not None:
+            try:
+                student.paid_fee = Decimal(str(paid_fee))
+            except Exception:
+                pass
+
+        if fee_due_date is not None:
+            if fee_due_date == '' or fee_due_date is None:
+                student.fee_due_date = None
+            else:
+                from django.utils.dateparse import parse_date
+                parsed_date = parse_date(fee_due_date)
+                if parsed_date:
+                    student.fee_due_date = parsed_date
+
+        student.save()
+        serializer = self.get_serializer(student)
+        return Response({
+            'status': 'Fee details updated successfully',
+            'student': serializer.data
+        })
+
+    @action(detail=True, methods=['post'])
+    def send_message(self, request, pk=None):
+        student = self.get_object()
+        message = (request.data.get('message') or '').strip()
+        if not message:
+            return Response({'error': 'Message is required'}, status=status.HTTP_400_BAD_REQUEST)
+        if not student.user:
+            return Response({'error': 'Student has no user account'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from notifications.models import Notification
+        is_welcome = request.data.get('message_type') == 'WELCOME'
+        Notification.objects.create(
+            user=student.user,
+            title="Welcome!" if is_welcome else "Message from your mentor",
+            message=message,
+            notification_type='BATCH',
+            target_url="/"
+        )
+        if is_welcome:
+            student.welcome_sent = True
+            student.welcome_sent_at = timezone.now()
+            student.save(update_fields=['welcome_sent', 'welcome_sent_at'])
+        return Response({'status': 'Message sent'})
+
+    @action(detail=True, methods=['post'])
+    def mark_welcome_sent(self, request, pk=None):
+        """Used when the message was sent through WhatsApp."""
+        student = self.get_object()
+        student.welcome_sent = True
+        student.welcome_sent_at = timezone.now()
+        student.save(update_fields=['welcome_sent', 'welcome_sent_at'])
+        return Response({'status': 'ok'})
+
+
+
+
+
+    @action(detail=True, methods=['post'])
+    def add_feedback(self, request, pk=None):
+        student = self.get_object()
+        d = request.data
+
+        status_val = d.get('status')
+        if status_val not in dict(StudentFeedback.STATUS_CHOICES):
+            return Response({'error': 'Valid status is required'}, status=400)
+
+        # Idempotent retry
+        mcid = d.get('mobile_call_id') or None
+        if mcid:
+            existing = StudentFeedback.objects.filter(mobile_call_id=mcid).first()
+            if existing:
+                return Response(StudentFeedbackSerializer(existing).data, status=200)
+
+        call_status = (d.get('call_status') or '').upper() or None
+        if call_status and call_status not in dict(StudentFeedback.CALL_STATUS_CHOICES):
+            call_status = None
+        call_direction = (d.get('call_direction') or '').upper() or None
+        if call_direction not in dict(StudentFeedback.CALL_DIRECTION_CHOICES):
+            call_direction = None
+        try:
+            duration = max(0, int(d.get('call_duration') or 0))
+        except (TypeError, ValueError):
+            duration = 0
+
+        if call_status in UNCONNECTED and status_val == 'CALL_DONE':
+            return Response(
+                {'error': 'The phone logged this call as not connected. Choose No Answer or Call Back.'},
+                status=400)
+
+        has_call = bool(mcid or call_status)
+        fb = StudentFeedback.objects.create(
+            student=student,
+            mentor=request.user,
+            feedback_date=d.get('feedback_date') or timezone.localdate(),
+            feedback_type='CALL' if has_call else (d.get('feedback_type') or 'CALL'),
+            status=status_val,
+            feedback=(d.get('feedback') or '').strip(),
+            next_followup_date=d.get('next_followup_date') or None,
+            mobile_call_id=mcid,
+            customer_number=d.get('customer_number') or None,
+            call_direction=call_direction,
+            call_status=call_status,
+            call_duration=duration,
+            start_time=parse_datetime(d.get('start_time') or '') if d.get('start_time') else None,
+            end_time=parse_datetime(d.get('end_time') or '') if d.get('end_time') else None,
+        )
+        return Response(StudentFeedbackSerializer(fb).data, status=201)
+
+    @action(detail=True, methods=['post'], url_path='feedback-recording',
+            parser_classes=[MultiPartParser, FormParser, JSONParser])
+    def feedback_recording(self, request, pk=None):
+        student = self.get_object()
+        fb = None
+        if request.data.get('feedback_id'):
+            fb = StudentFeedback.objects.filter(student=student, pk=request.data['feedback_id']).first()
+        if not fb and request.data.get('mobile_call_id'):
+            fb = StudentFeedback.objects.filter(student=student,
+                                                mobile_call_id=request.data['mobile_call_id']).first()
+        if not fb:
+            return Response({'error': 'Feedback not found'}, status=404)
+        if (fb.call_status or '').upper() in UNCONNECTED:
+            return Response({'error': 'Recordings cannot be attached to unconnected calls'}, status=400)
+
+        f = request.FILES.get('audio_recording')
+        if not f:
+            return Response({'error': 'audio_recording file is required'}, status=400)
+        try:
+            validate_audio_recording_file(f)      # FileField validators don't run on .save()
+        except DjangoValidationError as e:
+            return Response({'error': '; '.join(e.messages)}, status=400)
+
+        fb.audio_recording = f
+        fb.save()
+        return Response(StudentFeedbackSerializer(fb).data)
+
+    @action(detail=True, methods=['get'])
+    def feedbacks(self, request, pk=None):
+        student = self.get_object()
+        qs = student.feedbacks.select_related('mentor')[:100]
+        return Response(StudentFeedbackSerializer(qs, many=True).data)
+
+    @action(detail=False, methods=['get'])
+    def feedback_summary(self, request):
+        today = timezone.localdate()
+        qs = self.get_queryset().filter(academic_status='ACTIVE')
+        rows = list(qs.values_list(
+            'batch__primary_mentor__first_name', 'batch__primary_mentor__last_name',
+            'batch__primary_mentor__username', 'last_feedback_status', 'last_feedback_date'))
+
+        by_status, mentors = {}, {}
+        for first, last, uname, st, dt in rows:
+            name = (f"{first or ''} {last or ''}".strip() or uname or 'Unassigned')
+            m = mentors.setdefault(name, {'mentor': name, 'total': 0, 'done': 0})
+            m['total'] += 1
+            if dt == today:
+                m['done'] += 1
+                by_status[st] = by_status.get(st, 0) + 1
+
+        done = sum(m['done'] for m in mentors.values())
+        return Response({
+            'total': len(rows), 'taken': done, 'not_taken': len(rows) - done,
+            'by_status': by_status,
+            'by_mentor': sorted(mentors.values(), key=lambda x: x['done'] - x['total']),
+        })
+
+
+
+    @action(
+        detail=False,
+        methods=['get'],
+        url_path='mentor-batches',
+        permission_classes=[permissions.IsAuthenticated]
+    )
+    def mentor_batches(self, request):
+        from core.models import Batch
+
+        user = request.user
+        role = str(user.role).upper().strip()
+
+        qs = Batch.objects.select_related(
+            'course',
+            'primary_mentor',
+            'teacher',
+        ).prefetch_related('secondary_mentors')
+
+        # Administrators can see all batches.
+        if role in ['SUPER_ADMIN', 'ADMIN'] or user.is_superuser:
+            pass
+
+        # Mentors and teachers see batches assigned to them.
+        elif role in MENTOR_ROLES:
+            qs = qs.filter(
+                Q(primary_mentor=user) |
+                Q(secondary_mentors=user) |
+                Q(teacher=user)
+            ).distinct()
+
+        else:
+            return Response(
+                {'detail': 'You do not have permission to view mentor batches.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        # Match the existing StudentViewSet visibility rules.
+        from crm.utils import get_converted_stage_values
+        converted_stage_ids = get_converted_stage_values()
+
+        student_filters = (
+            Q(students__is_active=True) &
+            ~Q(students__lead_status__iexact='DUPLICATE') &
+            Q(students__lead_status__in=converted_stage_ids)
+        )
+
+        qs = qs.annotate(
+            student_count=Count(
+                'students',
+                filter=student_filters,
+                distinct=True
+            )
+        ).order_by('name')
+
+        data = []
+
+        for batch in qs:
+            primary = batch.primary_mentor
+            teacher = batch.teacher
+
+            secondary = [
+                mentor.get_full_name() or mentor.username
+                for mentor in batch.secondary_mentors.all()
+            ]
+
+            data.append({
+                'id': batch.id,
+                'name': batch.name,
+                'course': batch.course.name if batch.course else '',
+                'start_date': batch.start_date,
+                'end_date': batch.end_date,
+                'primary_mentor': (
+                    primary.get_full_name() or primary.username
+                    if primary else None
+                ),
+                'secondary_mentors': secondary,
+                'teacher': (
+                    teacher.get_full_name() or teacher.username
+                    if teacher else None
+                ),
+                'student_count': batch.student_count,
+            })
+
+        return Response(data)
+
+
+
+    from django.db.models import Q
+    @action(detail=False, methods=['get'])
+    def recent_feedbacks(self, request):
+        user = request.user
+        qs = StudentFeedback.objects.select_related('student', 'mentor').order_by('-feedback_date', '-id')
+
+        # Admins see everything; mentors see their own and their batches' students
+        if getattr(user, 'role', None) not in ('ADMIN', 'SUPER_ADMIN'):
+            qs = qs.filter(
+                Q(mentor=user) |
+                Q(student__batch__primary_mentor=user) |
+                Q(student__batch__secondary_mentors=user)
+            ).distinct()
+
+        if request.query_params.get('calls_only') == 'true':
+            qs = qs.filter(
+                Q(call_duration__gt=0) |
+                Q(status__in=['CALL_DONE', 'NO_ANSWER', 'NOT_REACHABLE', 'CALL_BACK'])
+            )
+
+        search = request.query_params.get('search')
+        if search:
+            qs = qs.filter(
+                Q(student__first_name__icontains=search) |
+                Q(student__last_name__icontains=search) |
+                Q(student__mobile__icontains=search)
+            )
+
+        page = self.paginate_queryset(qs)
+        rows = [{
+            'id': f.id,
+            'student': f.student_id,
+            'student_name': f"{f.student.first_name} {f.student.last_name}".strip(),
+            'student_phone': f.student.mobile,
+            'status': f.status,
+            'status_display': f.get_status_display(),
+            'feedback': f.feedback,
+            'feedback_date': f.feedback_date,
+            'next_followup_date': f.next_followup_date,
+            'mentor_name': (f.mentor.get_full_name() or f.mentor.username) if f.mentor else '',
+            'call_duration': getattr(f, 'call_duration', 0),
+            'call_direction': getattr(f, 'call_direction', ''),
+            'call_status': getattr(f, 'call_status', ''),
+            'customer_number': getattr(f, 'customer_number', ''),
+            'recording_url': f.recording_url or (f.audio_recording.url if f.audio_recording else None),
+        } for f in page]
+        return self.get_paginated_response(rows)
+
+
+    
+
+class TransactionViewSet(viewsets.ModelViewSet):
+    queryset = Transaction.objects.all()
+    serializer_class = TransactionSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+class DocumentViewSet(viewsets.ModelViewSet):
+    queryset = Document.objects.all()
+    serializer_class = DocumentSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+class SyllabusPartViewSet(viewsets.ModelViewSet):
+    queryset = SyllabusPart.objects.all()
+    serializer_class = SyllabusPartSerializer
+    permission_classes = [DynamicRolePermission, IsMentorOwner]
+    
+    @property
+    def module_name(self):
+        if hasattr(self, 'request') and self.request.user.is_authenticated:
+            if self.request.user.role == 'TEACHER':
+                return 'TEACHER'
+        return 'MENTOR'
+
+    def get_queryset(self):
+        batch_id = self.request.query_params.get('batch')
+        if batch_id:
+            return self.queryset.filter(batch_id=batch_id)
+        return self.queryset
+
+class ClassSessionViewSet(viewsets.ModelViewSet):
+    queryset = ClassSession.objects.all()
+    serializer_class = ClassSessionSerializer
+    permission_classes = [DynamicRolePermission, IsMentorOwner]
+    
+    @property
+    def module_name(self):
+        if hasattr(self, 'request') and self.request.user.is_authenticated:
+            if self.request.user.role == 'TEACHER':
+                return 'TEACHER'
+        return 'MENTOR'
+    
+    def get_queryset(self):
+        batch_id = self.request.query_params.get('batch')
+        if batch_id:
+            return self.queryset.filter(batch_id=batch_id)
+        return self.queryset
+
+class AttendanceViewSet(viewsets.ModelViewSet):
+    queryset = Attendance.objects.all()
+    serializer_class = AttendanceSerializer
+    permission_classes = [DynamicRolePermission, IsMentorOwner]
+    
+    @property
+    def module_name(self):
+        if hasattr(self, 'request') and self.request.user.is_authenticated:
+            if self.request.user.role == 'TEACHER':
+                return 'TEACHER'
+        return 'MENTOR'
+
+class BatchResourceViewSet(viewsets.ModelViewSet):
+    queryset = BatchResource.objects.all()
+    serializer_class = BatchResourceSerializer
+    permission_classes = [DynamicRolePermission, IsMentorOwner]
+    
+    @property
+    def module_name(self):
+        if hasattr(self, 'request') and self.request.user.is_authenticated:
+            if self.request.user.role == 'TEACHER':
+                return 'TEACHER'
+        return 'MENTOR'
+
+    def get_queryset(self):
+        batch_id = self.request.query_params.get('batch')
+        if batch_id:
+            return self.queryset.filter(batch_id=batch_id)
+        return self.queryset
+
+
+class ExamViewSet(viewsets.ModelViewSet):
+    queryset = Exam.objects.all()
+    serializer_class = ExamSerializer
+    permission_classes = [DynamicRolePermission, IsMentorOwner]
+    
+    @property
+    def module_name(self):
+        if hasattr(self, 'request') and self.request.user.is_authenticated:
+            if self.request.user.role == 'TEACHER':
+                return 'TEACHER'
+        return 'MENTOR'
+
+    def get_queryset(self):
+        batch_id = self.request.query_params.get('batch')
+        if batch_id:
+            return self.queryset.filter(batch_id=batch_id)
+        return self.queryset
+
+class ExamResultViewSet(viewsets.ModelViewSet):
+    queryset = ExamResult.objects.all()
+    serializer_class = ExamResultSerializer
+    permission_classes = [DynamicRolePermission, IsMentorOwner]
+    
+    @property
+    def module_name(self):
+        if hasattr(self, 'request') and self.request.user.is_authenticated:
+            if self.request.user.role == 'TEACHER':
+                return 'TEACHER'
+        return 'MENTOR'
+
+    @action(detail=False, methods=['post'])
+    def bulk_submit(self, request):
+        exam_id = request.data.get('exam_id')
+        results = request.data.get('results', {}) # student_id -> marks
+        
+        exam = Exam.objects.get(id=exam_id)
+        for student_id, data in results.items():
+            ExamResult.objects.update_or_create(
+                exam=exam,
+                student_id=student_id,
+                defaults={
+                    'marks_obtained': data.get('marks', 0),
+                    'remarks': data.get('remarks', ''),
+                    'is_present': data.get('is_present', True)
+                }
+            )
+        return Response({'status': 'Marks updated successfully'})
+
+
+class QuestionViewSet(viewsets.ModelViewSet):
+    queryset = Question.objects.all()
+    serializer_class = QuestionSerializer
+    permission_classes = [DynamicRolePermission]
+    
+    @property
+    def module_name(self):
+        return 'TEACHER'
+
+    def get_queryset(self):
+        exam_id = self.request.query_params.get('exam')
+        if exam_id:
+            return self.queryset.filter(exam_id=exam_id)
+        return self.queryset
+
+class StudentSubmissionViewSet(viewsets.ModelViewSet):
+    queryset = StudentSubmission.objects.all()
+    serializer_class = StudentSubmissionSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def perform_create(self, serializer):
+        # Auto-grade MCQs upon submission
+        instance = serializer.save()
+        if instance.is_submitted:
+            self.calculate_score(instance)
+
+    def calculate_score(self, submission):
+        exam = submission.exam
+        questions = exam.questions.all()
+        total_score = 0
+        
+        for q in questions:
+            user_ans = submission.answers_json.get(str(q.id))
+            if q.question_type == 'MCQ' and user_ans:
+                # user_ans is the option_id for MCQs
+                correct_opt = q.options.filter(is_correct=True).first()
+                if correct_opt and str(correct_opt.id) == str(user_ans):
+                    total_score += q.marks
+            # Theory questions remain for manual grading later
+        
+        submission.score = total_score
+        submission.save()
+
+class DashboardStatsView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+
+        # DASHBOARD_ROLES = ['SUPER_ADMIN', 'ADMIN', 'ACADEMIC', 'ACADEMIC_COORDINATOR',
+        #                 'MENTOR', 'TEACHER', 'SALES']
+        # if not (user.is_superuser or user.role in DASHBOARD_ROLES):
+        #     return Response({'error': 'Permission denied'}, status=403)
+
+
+        # Use Q for complex lookups if needed
+        from django.db.models import Q, OuterRef, Subquery, Case, When
+        from django.db.models.functions import Coalesce
+        from django.db import models
+        from decimal import Decimal
+        
+        from crm.utils import get_converted_stage_values, get_new_stage_values
+        converted_stage_ids = get_converted_stage_values()
+
+        try:
+            new_stage_ids = get_new_stage_values()
+        except Exception:
+            new_stage_ids = ['NEW', 'New', 'new', 'New Lead']
+            try:
+                from crm.models import PipelineStage
+                for stage in PipelineStage.objects.filter(Q(name__iregex=r'^new( lead)?$') | Q(is_default=True)):
+                    new_stage_ids.append(str(stage.id))
+            except Exception:
+                pass
+
+        student_qs = Student.objects.filter(is_active=True, lead_status__in=converted_stage_ids)
+        batch_qs = Batch.objects.all()
+        trans_qs = Transaction.objects.all()
+        
+        # Import RolePermission to check for ANALYTICS access for revenue
+        from users.models import RolePermission
+        has_analytics = user.role == 'SUPER_ADMIN' or user.is_superuser or \
+                        RolePermission.objects.filter(role=user.role, module='ANALYTICS', can_view=True).exists()
+        
+        if user.role in ['MENTOR', 'TEACHER']:
+            # Include subordinates if any
+            subordinates = user.get_all_subordinates()
+            if subordinates:
+                users_to_check = [user] + subordinates
+                student_qs = student_qs.filter(Q(batch__primary_mentor__in=users_to_check) | Q(batch__secondary_mentors__in=users_to_check) | Q(batch__teacher__in=users_to_check)).distinct()
+                batch_qs = batch_qs.filter(Q(primary_mentor__in=users_to_check) | Q(secondary_mentors__in=users_to_check) | Q(teacher__in=users_to_check)).distinct()
+            else:
+                student_qs = student_qs.filter(Q(batch__primary_mentor=user) | Q(batch__secondary_mentors=user) | Q(batch__teacher=user)).distinct()
+                batch_qs = batch_qs.filter(Q(primary_mentor=user) | Q(secondary_mentors=user) | Q(teacher=user)).distinct()
+            # Mentors generally don't see revenue unless they have explicit analytical perms
+            if not has_analytics:
+                trans_qs = Transaction.objects.none()
+        
+        elif user.role in ['SALES', 'SALES_HEAD', 'SALES_MANAGER', 'MANAGER', 'SALES_LEAD']:
+            from crm.utils import check_is_sales_manager
+            if not check_is_sales_manager(user):
+                student_qs = student_qs.filter(assigned_to=user)
+            else:
+                user_section = getattr(user, 'sales_section', 'BOTH')
+                if user_section and user_section != 'BOTH':
+                    student_qs = student_qs.filter(
+                        Q(assigned_to__sales_section=user_section) |
+                        Q(sales_section=user_section)
+                    )
+            if not has_analytics:
+                trans_qs = Transaction.objects.none()
+        
+        elif user.role == 'STUDENT':
+            # Students are redirected, but for safety: 
+            return Response({'error': 'Unauthorized'}, status=status.HTTP_403_FORBIDDEN)
+            
+        # Optional filter by specific mentor
+        mentor_id = request.query_params.get('mentor_id')
+        if mentor_id:
+            if user.role in ['SUPER_ADMIN', 'ADMIN', 'ACADEMIC', 'ACADEMIC_COORDINATOR']:
+                # Admins can filter by any mentor
+                student_qs = student_qs.filter(batch__primary_mentor_id=mentor_id).distinct()
+                batch_qs = batch_qs.filter(primary_mentor_id=mentor_id).distinct()
+            elif user.role in ['MENTOR', 'TEACHER'] and hasattr(user, 'get_all_subordinates'):
+                subordinates = user.get_all_subordinates()
+                # Verify requested mentor is a subordinate or self
+                if str(mentor_id) == str(user.id) or any(str(sub.id) == str(mentor_id) for sub in subordinates):
+                    student_qs = student_qs.filter(batch__primary_mentor_id=mentor_id).distinct()
+                    batch_qs = batch_qs.filter(primary_mentor_id=mentor_id).distinct()
+
+
+        # --- Date range filter (counts only) ---
+        from django.utils.dateparse import parse_date
+        start_date = parse_date(request.query_params.get('start_date') or '')
+        end_date = parse_date(request.query_params.get('end_date') or '')
+
+        # Apply the selected date range to student counts
+        students_count_qs = student_qs.exclude(
+            academic_status='DISCONTINUED'
+        )
+
+        students_all_qs = student_qs
+        batches_count_qs = batch_qs
+
+        if start_date:
+            students_count_qs = students_count_qs.filter(
+                created_at__date__gte=start_date
+            )
+            students_all_qs = students_all_qs.filter(
+                created_at__date__gte=start_date
+            )
+
+            # Batches still running on or after the start date
+            batches_count_qs = batches_count_qs.filter(
+                Q(end_date__isnull=True) |
+                Q(end_date__gte=start_date)
+            )
+
+        if end_date:
+            students_count_qs = students_count_qs.filter(
+                created_at__date__lte=end_date
+            )
+            students_all_qs = students_all_qs.filter(
+                created_at__date__lte=end_date
+            )
+
+            batches_count_qs = batches_count_qs.filter(
+                start_date__lte=end_date
+            )
+
+
+
+        lead_qs = Student.objects.filter(
+            is_active=True,
+            lead_status__in=new_stage_ids,
+        ).exclude(lead_status__in=converted_stage_ids).exclude(lead_status__iexact='DUPLICATE')
+
+        campaign_only = request.query_params.get('campaign_only') == 'true'
+        if campaign_only:
+            lead_qs = lead_qs.filter(campaign__isnull=False)
+
+        if user.role in ['SALES', 'SALES_HEAD', 'SALES_MANAGER', 'MANAGER', 'SALES_LEAD']:
+            from crm.utils import check_is_sales_manager
+            if not check_is_sales_manager(user):
+                lead_qs = lead_qs.filter(assigned_to=user)
+            else:
+                user_section = getattr(user, 'sales_section', 'BOTH')
+                if user_section and user_section != 'BOTH':
+                    lead_qs = lead_qs.filter(
+                        Q(assigned_to__sales_section=user_section) |
+                        Q(sales_section=user_section)
+                    )
+        elif user.role in ['MENTOR', 'TEACHER']:
+            lead_qs = lead_qs.none()
+
+        # Finance Integration
+        from finance.models import Expense
+        from django.utils import timezone
+        import calendar
+
+        now = timezone.now()
+        today_date = now.date()
+        first_day_of_month = today_date.replace(day=1)
+        _, last_day_num = calendar.monthrange(today_date.year, today_date.month)
+        last_day_of_month = today_date.replace(day=last_day_num)
+
+        monthly_expenses = Expense.objects.filter(
+            date__gte=first_day_of_month,
+            date__lte=last_day_of_month
+        ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        total_expenses = Expense.objects.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+
+        # Calculate monthly expected, collected, due fee metrics
+        # Subquery to calculate MonthlyPayment sum for current month for each student
+        monthly_pay_subquery = MonthlyPayment.objects.filter(
+            student=OuterRef('pk'),
+            month=first_day_of_month
+        ).values('student').annotate(
+            total=Sum('amount')
+        ).values('total')
+
+        # Subquery to calculate Transaction sum for current month for each student
+        monthly_txn_subquery = Transaction.objects.filter(
+            student=OuterRef('pk'),
+            date__date__gte=first_day_of_month,
+            date__date__lte=last_day_of_month
+        ).values('student').annotate(
+            total=Sum('amount')
+        ).values('total')
+
+        # Annotate student_qs with reliable current-month collections from timestamped records
+        student_fees_qs = student_qs.annotate(
+            current_month_mp=Coalesce(
+                Subquery(monthly_pay_subquery),
+                Decimal('0.00'),
+                output_field=models.DecimalField(max_digits=10, decimal_places=2)
+            ),
+            current_month_txn=Coalesce(
+                Subquery(monthly_txn_subquery),
+                Decimal('0.00'),
+                output_field=models.DecimalField(max_digits=10, decimal_places=2)
+            ),
+        ).annotate(
+            current_month_collected=F('current_month_mp') + F('current_month_txn'),
+            collected_fee=F('current_month_mp') + F('current_month_txn'),
+            expected_fee=Case(
+                When(course__fee_amount__gt=0, then=F('course__fee_amount')),
+                When(
+                    fee_due_date__gte=first_day_of_month,
+                    fee_due_date__lte=last_day_of_month,
+                    total_fee__gt=F('paid_fee'),
+                    then=(F('current_month_mp') + F('current_month_txn') + (F('total_fee') - F('paid_fee')))
+                ),
+                default=(F('current_month_mp') + F('current_month_txn')),
+                output_field=models.DecimalField(max_digits=10, decimal_places=2)
+            )
+        )
+
+        expected_monthly_revenue = student_fees_qs.aggregate(total=Sum('expected_fee'))['total'] or Decimal('0.00')
+        collected_monthly_revenue = student_fees_qs.aggregate(total=Sum('collected_fee'))['total'] or Decimal('0.00')
+        due_monthly_revenue = max(Decimal('0.00'), expected_monthly_revenue - collected_monthly_revenue)
+
+        # Batch fees breakdown
+        batch_fees = []
+        for b in batch_qs:
+            batch_students = student_fees_qs.filter(batch=b)
+            b_expected = batch_students.aggregate(total=Sum('expected_fee'))['total'] or Decimal('0.00')
+            b_collected = batch_students.aggregate(total=Sum('collected_fee'))['total'] or Decimal('0.00')
+            b_due = max(Decimal('0.00'), b_expected - b_collected)
+            
+            batch_fees.append({
+                "id": b.id,
+                "name": b.name,
+                "student_count": batch_students.count(),
+                "expected": float(b_expected),
+                "collected": float(b_collected),
+                "due": float(b_due)
+            })
+
+        stats = {
+            "students": students_count_qs.distinct().count(),
+            "students_all": students_all_qs.distinct().count(),
+            "batches": batches_count_qs.distinct().count(),
+            "revenue": trans_qs.aggregate(total=Sum('amount'))['total'] or 0,
+            "leads": lead_qs.count(),
+            "distribution": list(student_qs.exclude(academic_status='DISCONTINUED')
+                                 .values(name=F('program_type__name')).annotate(value=Count('id'))),
+            "revenue_distribution": list(trans_qs.values(name=F('student__program_type__name')).annotate(value=Sum('amount'))),
+            "expenses": float(monthly_expenses),
+            "total_expenses": float(total_expenses),
+            "this_month_expected": float(expected_monthly_revenue),
+            "this_month_collected": float(collected_monthly_revenue),
+            "this_month_due": float(due_monthly_revenue),
+            "batch_fees": batch_fees
+        }
+        
+        # Include team information
+        team_data = []
+        has_team = False
+        if user.role in ['SUPER_ADMIN', 'ADMIN', 'ACADEMIC', 'ACADEMIC_COORDINATOR']:
+            has_team = True
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            all_mentors = User.objects.filter(role='MENTOR', is_active=True)
+            team_data.append({'id': '', 'name': 'All Mentors'})
+            for m in all_mentors:
+                team_data.append({'id': m.id, 'name': f"{m.first_name} {m.last_name}"})
+        elif user.role in ['MENTOR', 'TEACHER'] and hasattr(user, 'get_all_subordinates'):
+            subordinates = user.get_all_subordinates()
+            if subordinates:
+                has_team = True
+                team_data.append({'id': user.id, 'name': 'My Work'})
+                for sub in subordinates:
+                    team_data.append({'id': sub.id, 'name': f"{sub.first_name} {sub.last_name}"})
+        
+        stats["has_team"] = has_team
+        stats["team_members"] = team_data
+        
+        return Response(stats)
+
+class AnalyticsDetailView(APIView):
+    permission_classes = [DynamicRolePermission]
+    module_name = 'ANALYTICS'
+
+    def get(self, request):
+        User = get_user_model()
+        teachers = User.objects.filter(role__in=['TEACHER', 'MENTOR'])
+        
+        batches = Batch.objects.annotate(student_count=Count('students'))
+        batch_stats = batches.values('id', 'name', 'course__name', 'student_count')
+        
+        from crm.utils import get_converted_stage_values
+        converted_stage_ids = get_converted_stage_values()
+        enrolled_students = Student.objects.filter(is_active=True, lead_status__in=converted_stage_ids)
+
+        program_id = request.query_params.get('program')
+        if program_id:
+            try:
+                enrolled_students = enrolled_students.filter(program_type_id=int(program_id))
+            except (ValueError, TypeError):
+                pass
+
+        total_potential = enrolled_students.aggregate(sum=Sum('course__fee_amount'))['sum'] or 0
+        total_collected = Transaction.objects.all().aggregate(sum=Sum('amount'))['sum'] or 0
+        total_due = max(0, total_potential - total_collected)
+
+        from core.models import ClassSession
+        import re
+        
+        month_param = request.query_params.get('month')
+        year_param = request.query_params.get('year')
+        parsed_month = None
+        parsed_year = None
+        if month_param and year_param:
+            try:
+                m = int(month_param)
+                y = int(year_param)
+                if 1 <= m <= 12 and 1900 <= y <= 2100:
+                    parsed_month = m
+                    parsed_year = y
+            except (ValueError, TypeError):
+                pass
+        
+        # Annotate teachers with their session counts, batch counts, and calculated hours
+        teacher_stats = []
+        for teacher in teachers:
+            b_count = Batch.objects.filter(Q(teacher=teacher) | Q(primary_mentor=teacher)).distinct().count()
+            
+            sessions = ClassSession.objects.filter(teacher=teacher).select_related('batch').prefetch_related('attendances__student')
+            if parsed_month and parsed_year:
+                sessions = sessions.filter(date__month=parsed_month, date__year=parsed_year)
+                
+            s_count = sessions.count()
+            
+            total_milliseconds = 0
+            batch_breakdown = {}
+            for session in sessions:
+                if session.teacher_summary:
+                    match = re.search(r'Duration:\s*(\d+)', session.teacher_summary)
+                    if match:
+                        ms = int(match.group(1))
+                        total_milliseconds += ms
+                        
+                        # Add to batch breakdown
+                        b_id = session.batch.id
+                        if b_id not in batch_breakdown:
+                            batch_breakdown[b_id] = {
+                                'batch_name': session.batch.name,
+                                'sessions': 0,
+                                'ms': 0,
+                                'dates': []
+                            }
+                        batch_breakdown[b_id]['sessions'] += 1
+                        batch_breakdown[b_id]['ms'] += ms
+                        
+                        s_mins = round(ms / (1000 * 60))
+                        s_h = s_mins // 60
+                        s_m = s_mins % 60
+                        s_duration = f"{s_h}h {s_m}m" if s_h > 0 else f"{s_m}m"
+                        
+                        attendances = session.attendances.select_related('student').all()
+                        present_students = []
+                        absent_students = []
+                        for a in attendances:
+                            name = f"{a.student.first_name} {a.student.last_name}".strip()
+                            if not name: name = a.student.username
+                            if a.is_present:
+                                present_students.append(name)
+                            else:
+                                absent_students.append(name)
+                        
+                        batch_breakdown[b_id]['dates'].append({
+                            'date': session.date.strftime("%d %b %Y"),
+                            'duration': s_duration,
+                            'present_count': len(present_students),
+                            'absent_count': len(absent_students),
+                            'present_students': present_students,
+                            'absent_students': absent_students
+                        })
+
+            
+            # format batch breakdown
+            classes_breakdown = []
+            for b_id, b_data in batch_breakdown.items():
+                b_mins = round(b_data['ms'] / (1000 * 60))
+                b_h = b_mins // 60
+                b_m = b_mins % 60
+                classes_breakdown.append({
+                    'batch_name': b_data['batch_name'],
+                    'sessions': b_data['sessions'],
+                    'formatted_time': f"{b_h}h {b_m}m",
+                    'dates': b_data['dates']
+                })
+            
+            # sort breakdown by sessions descending
+            classes_breakdown.sort(key=lambda x: x['sessions'], reverse=True)
+            
+            # The Wise LMS API returned duration in milliseconds
+            total_minutes = round(total_milliseconds / (1000 * 60))
+            full_hours = int(total_minutes // 60)
+            rem_minutes = int(total_minutes % 60)
+            
+            if b_count > 0 or s_count > 0:
+                teacher_stats.append({
+                    'id': teacher.id,
+                    'name': f"{teacher.first_name} {teacher.last_name}".strip() or teacher.username,
+                    'courses': b_count,
+                    'sessions': s_count,
+                    'hours': round(total_minutes / 60, 2), # Keep for sorting
+                    'formatted_time': f"{full_hours}h {rem_minutes}m",
+                    'classes': classes_breakdown
+                })
+
+        # sort by hours
+        teacher_stats = sorted(teacher_stats, key=lambda x: x['hours'], reverse=True)
+
+        # Advanced Charting Data
+        from django.db.models.functions import TruncMonth
+        
+        program_dist = list(enrolled_students.values(name=F('program_type__name')).annotate(value=Count('id')))
+        
+        from crm.models import PipelineStage
+        stage_names = {str(s.id): s.name for s in PipelineStage.objects.all()}
+        standard_mapping = {
+            'NEW': 'New Lead',
+            'FOLLOW_UP': 'Follow-up',
+            'PAYMENT_PENDING': 'Payment Pending',
+            'ENROLLED': 'Converted',
+            'CONVERTED': 'Converted',
+            'DROPPED': 'Dropped'
+        }
+        raw_lead_counts = Student.objects.filter(is_active=True).exclude(lead_status__iexact='DUPLICATE').values('lead_status').annotate(value=Count('id'))
+        funnel_dict = {}
+        for item in raw_lead_counts:
+            st = str(item['lead_status'] or '')
+            display_name = standard_mapping.get(st, stage_names.get(st, st))
+            funnel_dict[display_name] = funnel_dict.get(display_name, 0) + item['value']
+        lead_dist = [{'name': k, 'value': v} for k, v in funnel_dict.items()]
+        
+        revenue_time = list(Transaction.objects.annotate(month_trunc=TruncMonth('date')).values('month_trunc').annotate(total=Sum('amount')).order_by('month_trunc'))
+        revenue_timeline = [{'name': rt['month_trunc'].strftime('%b %Y') if rt['month_trunc'] else 'Unknown', 'revenue': rt['total']} for rt in revenue_time]
+
+        return Response({
+            'teachers_count': teachers.count(),
+            'students_count': enrolled_students.count(),
+            'batches_count': Batch.objects.count(),
+            'batch_details': batch_stats,
+            'teacher_performance': teacher_stats,
+            'revenue_metrics': {
+                'potential': total_potential,
+                'collected': total_collected,
+                'due': total_due
+            },
+            'program_distribution': program_dist,
+            'lead_funnel': lead_dist,
+            'revenue_timeline': revenue_timeline
+        })
+
+class CalendarEventsView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        from core.models import Exam, ClassSession
+        
+        events = []
+        
+        # Exams
+        exams = Exam.objects.all().select_related('batch')
+        for exam in exams:
+            events.append({
+                'id': f"exam_{exam.id}",
+                'title': f"{exam.batch.name} - {exam.title} ({exam.get_exam_type_display()})",
+                'start': exam.date.isoformat(),
+                'end': exam.date.isoformat(),
+                'allDay': True,
+                'type': 'exam',
+                'resourceId': exam.batch.id
+            })
+            
+        # Class Sessions
+        sessions = ClassSession.objects.all().select_related('batch', 'teacher')
+        for session in sessions:
+            teacher_name = f"{session.teacher.first_name} {session.teacher.last_name}".strip() if session.teacher else "Unknown Teacher"
+            events.append({
+                'id': f"class_{session.id}",
+                'title': f"{session.batch.name} - Class ({teacher_name})",
+                'start': session.date.isoformat(),
+                'end': session.date.isoformat(),
+                'allDay': True,
+                'type': 'class',
+                'resourceId': session.batch.id
+            })
+            
+        return Response(events)
+
+class StudentTeacherHandoverViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = StudentTeacherHandover.objects.select_related('student', 'previous_teacher', 'current_teacher', 'changed_by').all()
+    serializer_class = StudentTeacherHandoverSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        student_id = self.request.query_params.get('student_id')
+        if student_id:
+            qs = qs.filter(student_id=student_id)
+        return qs
+

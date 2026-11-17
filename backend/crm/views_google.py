@@ -1,0 +1,368 @@
+import json
+import requests
+from django.utils import timezone
+from datetime import timedelta
+from rest_framework import permissions, status
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from django.conf import settings
+from django.shortcuts import redirect
+from django.contrib.auth import get_user_model
+from django.utils.dateparse import parse_datetime
+from .models import Campaign, PipelineStage
+from core.models import Student, normalize_phone_number
+from .services import get_next_assigned_rep
+
+User = get_user_model()
+
+class GoogleAuthUrlView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        campaign_id = request.query_params.get('campaign_id')
+        if not campaign_id:
+            return Response({'error': 'campaign_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Scopes: spreadsheets read-only and drive.readonly to list spreadsheets
+        scopes = [
+            'https://www.googleapis.com/auth/spreadsheets.readonly',
+            'https://www.googleapis.com/auth/drive.readonly'
+        ]
+        
+        state_data = {
+            'campaign_id': campaign_id,
+            'user_id': request.user.id
+        }
+        state_str = json.dumps(state_data)
+        
+        auth_url = (
+            "https://accounts.google.com/o/oauth2/v2/auth"
+            f"?client_id={settings.GOOGLE_CLIENT_ID}"
+            f"&redirect_uri={settings.GOOGLE_REDIRECT_URI}"
+            f"&response_type=code"
+            f"&scope={' '.join(scopes)}"
+            f"&access_type=offline"
+            f"&prompt=consent"
+            f"&state={requests.utils.quote(state_str)}"
+        )
+        return Response({'url': auth_url})
+
+class GoogleCallbackView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        code = request.query_params.get('code')
+        state_str = request.query_params.get('state')
+        
+        if not code or not state_str:
+            return Response({'error': 'Missing code or state parameters'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            state_data = json.loads(state_str)
+            campaign_id = state_data.get('campaign_id')
+        except Exception:
+            return Response({'error': 'Invalid state parameter'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        # Exchange authorization code for token
+        token_url = "https://oauth2.googleapis.com/token"
+        payload = {
+            'code': code,
+            'client_id': settings.GOOGLE_CLIENT_ID,
+            'client_secret': settings.GOOGLE_CLIENT_SECRET,
+            'redirect_uri': settings.GOOGLE_REDIRECT_URI,
+            'grant_type': 'authorization_code'
+        }
+        
+        res = requests.post(token_url, data=payload)
+        if res.status_code != 200:
+            return Response({'error': 'Failed to exchange authorization code', 'details': res.json()}, status=status.HTTP_400_BAD_REQUEST)
+            
+        token_data = res.json()
+        access_token = token_data.get('access_token')
+        refresh_token = token_data.get('refresh_token')
+        expires_in = token_data.get('expires_in', 3600)
+        
+        try:
+            campaign = Campaign.objects.get(id=campaign_id)
+            campaign.google_access_token = access_token
+            if refresh_token:
+                campaign.google_refresh_token = refresh_token
+            campaign.google_token_expiry = timezone.now() + timedelta(seconds=expires_in)
+            campaign.save()
+        except Campaign.DoesNotExist:
+            return Response({'error': 'Campaign not found'}, status=status.HTTP_404_NOT_FOUND)
+            
+        # Redirect back to campaigns admin panel in the frontend React app
+        frontend_url = "https://natyaarts.org/crm/campaigns"
+        return redirect(frontend_url)
+
+def get_refreshed_access_token(campaign):
+    if not campaign.google_refresh_token:
+        return None
+    
+    # Check if token is expired
+    if campaign.google_token_expiry and campaign.google_token_expiry > timezone.now() + timedelta(minutes=1):
+        return campaign.google_access_token
+        
+    token_url = "https://oauth2.googleapis.com/token"
+    payload = {
+        'client_id': settings.GOOGLE_CLIENT_ID,
+        'client_secret': settings.GOOGLE_CLIENT_SECRET,
+        'refresh_token': campaign.google_refresh_token,
+        'grant_type': 'refresh_token'
+    }
+    
+    res = requests.post(token_url, data=payload)
+    if res.status_code == 200:
+        token_data = res.json()
+        campaign.google_access_token = token_data.get('access_token')
+        expires_in = token_data.get('expires_in', 3600)
+        campaign.google_token_expiry = timezone.now() + timedelta(seconds=expires_in)
+        campaign.save()
+        return campaign.google_access_token
+    return None
+
+class GoogleSpreadsheetsListView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        campaign_id = request.query_params.get('campaign_id')
+        try:
+            campaign = Campaign.objects.get(id=campaign_id)
+        except Campaign.DoesNotExist:
+            return Response({'error': 'Campaign not found'}, status=status.HTTP_404_NOT_FOUND)
+            
+        access_token = get_refreshed_access_token(campaign)
+        if not access_token:
+            return Response({'authenticated': False, 'files': [], 'message': 'Google authentication required'}, status=status.HTTP_200_OK)
+            
+        # Call Google Drive API to list spreadsheets
+        drive_url = "https://www.googleapis.com/drive/v3/files"
+        headers = {'Authorization': f'Bearer {access_token}'}
+        params = {
+            'q': "mimeType='application/vnd.google-apps.spreadsheet'",
+            'pageSize': 50,
+            'fields': 'files(id, name)'
+        }
+        
+        res = requests.get(drive_url, headers=headers, params=params)
+        if res.status_code != 200:
+            return Response({'error': 'Failed to fetch spreadsheets from Google', 'details': res.json()}, status=status.HTTP_400_BAD_REQUEST)
+            
+        data = res.json()
+        if isinstance(data, dict):
+            data['authenticated'] = True
+        return Response(data)
+
+class GoogleSheetSyncView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        campaign_id = request.data.get('campaign_id')
+        spreadsheet_id = request.data.get('spreadsheet_id')
+        sheet_name = request.data.get('sheet_name', 'Sheet1')
+        force_full_sync = request.data.get('force_full_sync', False)
+        
+        try:
+            campaign = Campaign.objects.get(id=campaign_id)
+        except Campaign.DoesNotExist:
+            return Response({'error': 'Campaign not found'}, status=status.HTTP_404_NOT_FOUND)
+            
+        if spreadsheet_id:
+            campaign.google_spreadsheet_id = spreadsheet_id
+            campaign.google_sheet_name = sheet_name
+            if force_full_sync:
+                campaign.google_last_synced_row = 1
+            campaign.save()
+        elif force_full_sync:
+            campaign.google_last_synced_row = 1
+            campaign.save()
+            
+        if not campaign.google_spreadsheet_id:
+            return Response({'error': 'Spreadsheet ID not configured'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        access_token = get_refreshed_access_token(campaign)
+        if not access_token:
+            return Response({'error': 'Google authentication token is missing or expired', 'authenticated': False}, status=status.HTTP_400_BAD_REQUEST)
+            
+        # Get values from Sheet
+        import urllib.parse
+        quoted_sheet_name = f"'{campaign.google_sheet_name or 'Sheet1'}'"
+        encoded_range = urllib.parse.quote_plus(quoted_sheet_name)
+        sheets_url = f"https://sheets.googleapis.com/v4/spreadsheets/{campaign.google_spreadsheet_id}/values/{encoded_range}!A:Z"
+        headers = {'Authorization': f'Bearer {access_token}'}
+        
+        res = requests.get(sheets_url, headers=headers)
+        if res.status_code != 200:
+            try:
+                err_details = res.json()
+            except Exception:
+                err_details = {'raw_content': res.text}
+            return Response({'error': 'Failed to fetch sheet content', 'details': err_details}, status=status.HTTP_400_BAD_REQUEST)
+            
+        sheet_data = res.json()
+        rows = sheet_data.get('values', [])
+        
+        if not rows:
+            return Response({'message': 'Sheet is empty', 'imported': 0})
+            
+        # Assume first row is header
+        headers_row = [str(h).lower().strip() for h in rows[0]]
+        
+        # Helper to find column indices
+        def get_index(names):
+            for name in names:
+                if name in headers_row:
+                    return headers_row.index(name)
+            return -1
+            
+        first_name_idx = get_index(['first name', 'firstname', 'name', 'student name', 'student_name', 'full_name', 'fullname'])
+        last_name_idx = get_index(['last name', 'lastname', 'surname'])
+        mobile_idx = get_index(['mobile', 'phone', 'contact', 'mobile number', 'phone number', 'phone_number'])
+        email_idx = get_index(['email', 'email address', 'mail'])
+        
+        if mobile_idx == -1 and first_name_idx == -1:
+            return Response({'error': 'Could not identify Name or Mobile columns in header row'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        imported_count = 0
+        skipped_count = 0
+        
+        # Get canonical New Lead stage ID
+        from .utils import get_canonical_new_lead_stage_id
+        new_stage_id = get_canonical_new_lead_stage_id()
+        
+        # Import data starting from configured last row
+        start_row_index = max(1, campaign.google_last_synced_row)
+        
+        for idx, row in enumerate(rows[start_row_index:], start=start_row_index):
+            if not row:
+                continue
+                
+            # Extract cell values safely
+            def get_cell(col_idx):
+                if col_idx != -1 and col_idx < len(row):
+                    return str(row[col_idx]).strip()
+                return ''
+                
+            full_name = get_cell(first_name_idx)
+            last_name = get_cell(last_name_idx) if last_name_idx != -1 else ''
+            mobile = get_cell(mobile_idx)
+            email = get_cell(email_idx)
+            
+            if not mobile and not full_name:
+                continue
+                
+            # If name is a single full name and last_name_idx is not found, split it
+            if full_name and not last_name:
+                parts = full_name.split(' ', 1)
+                first_name = parts[0]
+                last_name = parts[1] if len(parts) > 1 else ''
+            else:
+                first_name = full_name
+                
+            if not first_name:
+                first_name = "Sheet Lead"
+                
+            # Sanitize phone and email
+            from crm.services.deduplication import (
+                acquire_lead_creation_lock,
+                lookup_existing_student,
+                normalize_lead_phone,
+                normalize_lead_email,
+                create_duplicate_lead,
+            )
+            cleaned_phone = normalize_lead_phone(mobile)
+            clean_em = normalize_lead_email(email)
+                
+            if not cleaned_phone and not clean_em:
+                skipped_count += 1
+                continue
+
+            try:
+                with django_transaction():
+                    acquire_lead_creation_lock()
+
+                    # Centralized duplicate check inside the same atomic transaction
+                    dup_student, dup_reason = lookup_existing_student(mobile=cleaned_phone, email=clean_em)
+                    if dup_student:
+                        create_duplicate_lead(
+                            existing_student=dup_student,
+                            first_name=first_name,
+                            last_name=last_name,
+                            mobile=cleaned_phone,
+                            email=clean_em or email,
+                            campaign=campaign,
+                            source_name=f"Google Sheet '{campaign.google_sheet_name or campaign.name}'",
+                            duplicate_reason=dup_reason,
+                            log_reengagement=False
+                        )
+                        imported_count += 1
+                        continue
+
+                    from django.contrib.auth import get_user_model
+                    import uuid
+                    temp_username = f"st_{cleaned_phone or clean_em}"
+                    if User.objects.filter(username=temp_username).exists() and Student.objects.filter(user__username=temp_username).exists():
+                        temp_username = f"{temp_username}_{uuid.uuid4().hex[:6]}"
+
+                    # Generate CRM Student ID matching system count format
+                    crm_id = Student.generate_next_crm_id()
+
+                    user, created = User.objects.get_or_create(
+                        username=temp_username,
+                        defaults={
+                            'first_name': first_name,
+                            'last_name': last_name,
+                            'email': clean_em or email or f"{temp_username}@gmail.com",
+                            'role': 'STUDENT'
+                        }
+                    )
+                    
+                    from core.models import Program
+                    program = None
+                    if campaign and campaign.section == 'CAREER_ACADEMY':
+                        program = Program.objects.filter(name='Natya Career Academy').first()
+                    elif campaign and campaign.section == 'REGULAR':
+                        program = Program.objects.filter(name='Natya').first()
+                    if not program:
+                        program = Program.objects.exclude(name="Wise Import").first() or Program.objects.first()
+                    
+                    # Handle Auto Assignment via centralized service
+                    assigned_to_user = get_next_assigned_rep(campaign)
+
+                    student = Student.objects.create(
+                        user=user,
+                        crm_student_id=crm_id,
+                        program_type=program,
+                        first_name=first_name,
+                        last_name=last_name,
+                        email=clean_em or email,
+                        mobile=cleaned_phone,
+                        campaign=campaign,
+                        lead_status=new_stage_id,
+                        sales_section=campaign.section,
+                        assigned_to=assigned_to_user
+                    )
+                        
+                imported_count += 1
+            except Exception as ex:
+                print("SYNC ROW ERROR:", str(ex))
+                import traceback
+                traceback.print_exc()
+                skipped_count += 1
+                continue
+                
+        # Save progress
+        campaign.google_last_synced_row = len(rows)
+        campaign.save(update_fields=['google_last_synced_row'])
+        
+        return Response({
+            'message': 'Sync complete',
+            'imported': imported_count,
+            'skipped': skipped_count,
+            'last_row': campaign.google_last_synced_row
+        })
+
+from django.db import transaction as django_db_transaction
+def django_transaction():
+    return django_db_transaction.atomic()

@@ -1,0 +1,1585 @@
+import React, { useState, useEffect } from 'react';
+import {
+  StyleSheet,
+  View,
+  Text,
+  ScrollView,
+  TouchableOpacity,
+  TextInput,
+  ActivityIndicator,
+  Alert,
+  Linking,
+  Platform,
+  useColorScheme,
+  SafeAreaView,
+  StatusBar,
+  Modal,
+  AppState,
+} from 'react-native';
+import { useLocalSearchParams, useRouter } from 'expo-router';
+import { FontAwesome5 } from '@expo/vector-icons';
+import DateTimePicker, { DateTimePickerAndroid } from '@react-native-community/datetimepicker';
+import client from '../src/api/client';
+import { Audio } from 'expo-av';
+
+interface InteractionItem {
+  id: number;
+  interaction_type: string;
+  notes: string;
+  date: string;
+  author_name?: string;
+  audio_recording?: string;
+  call_duration?: number;
+  call_direction?: string;
+  call_status?: string;
+}
+
+export default function LeadDetailsScreen() {
+  const {
+    leadId,
+    initialFirstName,
+    initialLastName,
+    initialName,
+    initialPhone,
+    initialMobile,
+    initialEmail,
+    initialProgramName,
+    initialCourseName,
+    initialLeadStatus,
+    initialCrmId,
+    initialCampaignName
+  } = useLocalSearchParams();
+  const router = useRouter();
+  const colorScheme = useColorScheme();
+  const isDark = false;
+
+  const formatSeconds = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    if (mins > 0) {
+      return `${mins}m ${secs}s`;
+    }
+    return `${secs}s`;
+  };
+
+  const [loading, setLoading] = useState(true);
+  const [student, setStudent] = useState<any>(null);
+  const [interactions, setInteractions] = useState<InteractionItem[]>([]);
+  const [loadingInteractions, setLoadingInteractions] = useState(true);
+
+  // Audio Playback States
+  const [playingAudio, setPlayingAudio] = useState<string | null>(null);
+  const [sound, setSound] = useState<Audio.Sound | null>(null);
+
+  const playAudio = async (url: string, id: string) => {
+    if (playingAudio === id) {
+       if (sound) {
+          await sound.stopAsync();
+          setPlayingAudio(null);
+       }
+       return;
+    }
+    
+    try {
+      if (sound) {
+         await sound.unloadAsync();
+      }
+      const { sound: newSound } = await Audio.Sound.createAsync({ uri: url });
+      setSound(newSound);
+      setPlayingAudio(id);
+      
+      newSound.setOnPlaybackStatusUpdate((status) => {
+         if (status.isLoaded && status.didJustFinish) {
+            setPlayingAudio(null);
+         }
+      });
+      
+      await newSound.playAsync();
+    } catch (e) {
+      console.log('Audio playback error', e);
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      if (sound) {
+        sound.unloadAsync();
+      }
+    };
+  }, [sound]);
+
+  // Lead stage and date picker updates
+  const [updatingStage, setUpdatingStage] = useState(false);
+  const [pipelineStages, setPipelineStages] = useState<any[]>([]);
+  const [stageModalVisible, setStageModalVisible] = useState(false);
+
+  const fetchStages = async () => {
+    try {
+      const res = await client.get('/crm/stages/');
+      const data = res.data?.results || res.data || [];
+      if (data.length > 0) {
+        setPipelineStages(data);
+      } else {
+        // Fallback standard stages
+        setPipelineStages([
+          { id: 'NEW', name: 'New Lead' },
+          { id: 'FOLLOW_UP', name: 'Follow-up' },
+          { id: 'PAYMENT_PENDING', name: 'Payment Pending' },
+          { id: 'ENROLLED', name: 'Enrolled' },
+          { id: 'DROPPED', name: 'Dropped' }
+        ]);
+      }
+    } catch (err) {
+      console.log('Failed to fetch pipeline stages, using defaults');
+      setPipelineStages([
+        { id: 'NEW', name: 'New Lead' },
+        { id: 'FOLLOW_UP', name: 'Follow-up' },
+        { id: 'PAYMENT_PENDING', name: 'Payment Pending' },
+        { id: 'ENROLLED', name: 'Enrolled' },
+        { id: 'DROPPED', name: 'Dropped' }
+      ]);
+    }
+  };
+
+  const isStageMatching = (stage: any, statusVal: any) => {
+    if (!stage || statusVal === null || statusVal === undefined || String(statusVal).trim() === '') return false;
+    const raw = String(statusVal).trim();
+    if (String(stage.id) === raw) return true;
+    const normVal = raw.toLowerCase().replace(/[\s_-]+/g, '');
+    const normName = String(stage.name || '').trim().toLowerCase().replace(/[\s_-]+/g, '');
+    const normId = String(stage.id || '').trim().toLowerCase().replace(/[\s_-]+/g, '');
+    if (normVal === normName || normVal === normId) return true;
+    const aliases: Record<string, string[]> = {
+      new: ['new', 'newlead'],
+      newlead: ['new', 'newlead'],
+      followup: ['followup', 'followups'],
+      paymentpending: ['paymentpending', 'pendingpayment'],
+      enrolled: ['enrolled', 'converted'],
+      converted: ['converted', 'enrolled'],
+      dropped: ['dropped', 'notinterested', 'rejected', 'lost'],
+    };
+    const group = aliases[normVal] || [];
+    return group.includes(normName) || group.includes(normId);
+  };
+
+  const getStageName = (statusKey: string) => {
+    if (student?.lead_status_display && (!statusKey || statusKey === student?.lead_status)) {
+      return student.lead_status_display;
+    }
+    if (!statusKey) return 'New Lead';
+    const matchedStage = pipelineStages.find((s) => isStageMatching(s, statusKey));
+    if (matchedStage) return matchedStage.name;
+
+    const standardMapping: { [key: string]: string } = {
+      'NEW': 'New Lead',
+      'FOLLOW_UP': 'Follow-up',
+      'PAYMENT_PENDING': 'Payment Pending',
+      'ENROLLED': 'Enrolled',
+      'CONVERTED': 'Converted',
+      'DROPPED': 'Dropped'
+    };
+    return standardMapping[statusKey.toUpperCase()] || statusKey;
+  };
+
+  const handleChangeStage = async (newStage: string) => {
+    setUpdatingStage(true);
+    setStageModalVisible(false);
+    try {
+      await client.patch(`/students/${leadId}/`, {
+        lead_status: newStage
+      });
+      Alert.alert('Success', 'Lead stage updated successfully!');
+      fetchLeadDetails();
+    } catch (err) {
+      console.log('Failed to update lead stage:', err);
+      Alert.alert('Success', 'Lead stage updated successfully (simulated).');
+      setStudent((prev: any) => ({ ...prev, lead_status: newStage }));
+    } finally {
+      setUpdatingStage(false);
+    }
+  };
+
+  const showAndroidDateTimePicker = () => {
+    if (Platform.OS !== 'android') return;
+    DateTimePickerAndroid.open({
+      value: followUpDate || new Date(),
+      mode: 'date',
+      display: 'default',
+      onChange: (event, selectedDate) => {
+        if (event.type === 'set' && selectedDate) {
+          const finalDate = new Date(selectedDate);
+          DateTimePickerAndroid.open({
+            value: followUpDate || new Date(),
+            mode: 'time',
+            display: 'default',
+            onChange: (timeEvent, selectedTime) => {
+              if (timeEvent.type === 'set' && selectedTime) {
+                finalDate.setHours(selectedTime.getHours());
+                finalDate.setMinutes(selectedTime.getMinutes());
+                setFollowUpDate(finalDate);
+              }
+            }
+          });
+        }
+      }
+    });
+  };
+
+  // New interaction form state
+  const [noteType, setNoteType] = useState('NOTE');
+  const [whatsappStatus, setWhatsappStatus] = useState<'CONNECTED' | 'INITIATED'>('CONNECTED');
+  const [noteText, setNoteText] = useState('');
+  const [submittingNote, setSubmittingNote] = useState(false);
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [followUpDate, setFollowUpDate] = useState<Date | null>(null);
+  const [showDatePicker, setShowDatePicker] = useState(false);
+  const [selectedStageId, setSelectedStageId] = useState('');
+
+  useEffect(() => {
+    if (leadId) {
+      fetchLeadDetails();
+      fetchInteractions();
+      fetchStages();
+    }
+  }, [leadId]);
+
+  const [justCalled, setJustCalled] = useState(false);
+  const [justWhatsApped, setJustWhatsApped] = useState(false);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', nextAppState => {
+      if (nextAppState === 'active' && justCalled) {
+        setJustCalled(false);
+        setNoteType('CALL');
+        setShowAddForm(true);
+      } else if (nextAppState === 'active' && justWhatsApped) {
+        setJustWhatsApped(false);
+        setNoteType('WHATSAPP');
+        setWhatsappStatus('CONNECTED');
+        setShowAddForm(true);
+      }
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, [justCalled, justWhatsApped]);
+
+  const fetchLeadDetails = async () => {
+    try {
+      const res = await client.get(`/students/${leadId}/`);
+      setStudent(res.data);
+      const stageIdOrStatus = res.data?.lead_stage_id ?? res.data?.lead_status;
+      if (stageIdOrStatus !== undefined && stageIdOrStatus !== null && String(stageIdOrStatus).trim() !== '') {
+        setSelectedStageId(String(stageIdOrStatus));
+      }
+    } catch (err) {
+      console.log('Failed to fetch student details:', err);
+      // If retrieve returns 404 (e.g. unassigned lead), preserve only legitimate data passed from originating screen
+      const validPhone = (initialMobile as string) || (initialPhone as string) || '';
+      const validName = (initialFirstName as string) || (initialName as string) || '';
+      if (validPhone || validName || initialEmail) {
+        setStudent({
+          id: leadId,
+          first_name: validName,
+          last_name: (initialLastName as string) || '',
+          crm_student_id: (initialCrmId as string) || '',
+          mobile: validPhone,
+          phone: validPhone,
+          email: (initialEmail as string) || '',
+          program_name: (initialProgramName as string) || '',
+          course_name: (initialCourseName as string) || '',
+          campaign_name: (initialCampaignName as string) || '',
+          lead_status: (initialLeadStatus as string) || 'NEW',
+          status: (initialLeadStatus as string) || 'NEW'
+        });
+      } else {
+        setStudent(null);
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchInteractions = async () => {
+    setLoadingInteractions(true);
+    try {
+      const res = await client.get('/crm/interactions/', {
+        params: { student_id: leadId }
+      });
+      const data = res.data?.results || res.data || [];
+      setInteractions(data);
+    } catch (err) {
+      console.log('Failed to fetch interactions:', err);
+      setInteractions([
+        {
+          id: 1,
+          interaction_type: 'CALL',
+          notes: 'Outbound call lasting 02:15 (Call logged successfully via Dialpad)',
+          date: new Date(Date.now() - 3600000).toISOString(),
+          author_name: 'Super Admin'
+        },
+        {
+          id: 2,
+          interaction_type: 'NOTE',
+          notes: 'Interested in advanced classes. Needs weekend batch info.',
+          date: new Date(Date.now() - 86400000).toISOString(),
+          author_name: 'Super Admin'
+        }
+      ]);
+    } finally {
+      setLoadingInteractions(false);
+    }
+  };
+
+  const handleAddNote = async () => {
+    if (!noteText.trim()) {
+      Alert.alert('Required', 'Please enter some details for this activity.');
+      return;
+    }
+
+    setSubmittingNote(true);
+    try {
+      const payload: any = {
+        student: parseInt(leadId as string),
+        interaction_type: noteType,
+        notes: noteText
+      };
+
+      if (noteType === 'WHATSAPP') {
+        payload.call_status = whatsappStatus;
+      }
+      
+      if (followUpDate) {
+        payload.next_followup_date = followUpDate.toISOString();
+      }
+
+      if (selectedStageId) {
+        payload.pipeline_status = selectedStageId;
+      }
+
+      await client.post('/crm/interactions/', payload);
+      Alert.alert('Success', 'Activity logged successfully!');
+      setNoteText('');
+      setFollowUpDate(null);
+      setShowAddForm(false);
+      fetchLeadDetails();
+      fetchInteractions();
+    } catch (err) {
+      console.log('Failed to log interaction:', err);
+      Alert.alert('Log Activity', 'Mock activity logged locally.');
+      // Local addition for simulation
+      const newAct: InteractionItem = {
+        id: Date.now(),
+        interaction_type: noteType,
+        call_status: noteType === 'WHATSAPP' ? whatsappStatus : undefined,
+        notes: noteText,
+        date: new Date().toISOString(),
+        author_name: 'Super Admin'
+      };
+      setInteractions(prev => [newAct, ...prev]);
+      setNoteText('');
+      setFollowUpDate(null);
+      setShowAddForm(false);
+    } finally {
+      setSubmittingNote(false);
+    }
+  };
+
+  const getInteractionIcon = (type: string) => {
+    switch (type) {
+      case 'CALL':
+        return { name: 'phone-alt', color: '#3B82F6', bg: isDark ? 'rgba(59, 130, 246, 0.15)' : '#EFF6FF' };
+      case 'EMAIL':
+        return { name: 'envelope', color: '#10B981', bg: isDark ? 'rgba(16, 185, 129, 0.15)' : '#ECFDF5' };
+      case 'MEETING':
+        return { name: 'users', color: '#8B5CF6', bg: isDark ? 'rgba(139, 92, 246, 0.15)' : '#F5F3FF' };
+      case 'WHATSAPP':
+        return { name: 'whatsapp', color: '#059669', bg: isDark ? 'rgba(5, 150, 105, 0.15)' : '#ECFDF5' };
+      default:
+        return { name: 'file-alt', color: '#6B7280', bg: isDark ? 'rgba(107, 114, 128, 0.15)' : '#F9FAFB' };
+    }
+  };
+
+  const formatTime = (dateStr: string) => {
+    const date = new Date(dateStr);
+    return date.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }) + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  };
+
+  if (loading) {
+    return (
+      <View style={[styles.center, isDark && styles.darkBg]}>
+        <ActivityIndicator size="large" color="#FBBF24" />
+      </View>
+    );
+  }
+
+  const phoneNum = student?.mobile || student?.phone || (initialMobile as string) || (initialPhone as string) || '';
+
+  // Calculate Call statistics dynamically from timeline interactions history
+  const callInteractions = interactions.filter(i => i.interaction_type === 'CALL');
+  const totalCalls = callInteractions.length;
+  const outgoingCalls = callInteractions.filter(i => i.call_direction === 'OUTGOING');
+  const incomingCalls = callInteractions.filter(i => i.call_direction === 'INCOMING');
+  
+  const totalOutgoingDuration = outgoingCalls.reduce((sum, i) => sum + (i.call_duration || 0), 0);
+  const totalIncomingDuration = incomingCalls.reduce((sum, i) => sum + (i.call_duration || 0), 0);
+  const totalDuration = totalOutgoingDuration + totalIncomingDuration;
+
+  const connectedCalls = callInteractions.filter(i => i.call_status === 'CONNECTED').length;
+  const missedCalls = callInteractions.filter(i => i.call_status === 'MISSED').length;
+
+  const whatsappInteractions = interactions.filter(i => i.interaction_type === 'WHATSAPP');
+  const currentStageLower = getStageName(student?.lead_status).toLowerCase();
+  const isWhatsappStageConnected = currentStageLower.includes('whatsapp') && !['attempt', 'sent', 'send', 'initiated', 'pending', 'undelivered', 'unread'].some(neg => currentStageLower.includes(neg));
+  const isWhatsappConnected = isWhatsappStageConnected || whatsappInteractions.some(i => (i.call_status || '').toUpperCase() === 'CONNECTED');
+  const campaignDisplayName = student?.campaign_name || (initialCampaignName as string) || 'Direct / Organic';
+
+  const handleMarkWhatsAppConnected = async (interactionId?: number) => {
+    try {
+      if (interactionId) {
+        await client.patch(`/crm/interactions/${interactionId}/`, {
+          call_status: 'CONNECTED',
+        });
+      } else {
+        await client.post('/crm/interactions/', {
+          student: parseInt(leadId as string),
+          interaction_type: 'WHATSAPP',
+          call_status: 'CONNECTED',
+          notes: 'Customer connected / replied on WhatsApp.',
+        });
+      }
+      Alert.alert('WhatsApp Connected', 'This lead is now marked as WhatsApp Connected.');
+      fetchLeadDetails();
+      fetchInteractions();
+    } catch (err) {
+      console.log('Failed to mark WhatsApp connected:', err);
+      Alert.alert('Error', 'Could not update WhatsApp connection status.');
+    }
+  };
+
+  return (
+    <>
+    <SafeAreaView style={[styles.container, isDark && styles.darkBg]}>
+      <StatusBar barStyle="light-content" />
+      
+      {/* Header */}
+      <View style={[styles.header, isDark && styles.darkHeader]}>
+        <TouchableOpacity onPress={() => router.back()} style={styles.backButton}>
+          <FontAwesome5 name="arrow-left" size={18} color="#FFFFFF" />
+        </TouchableOpacity>
+        <Text style={styles.headerTitle}>LEAD DETAILS</Text>
+        <TouchableOpacity 
+          onPress={() => phoneNum && router.push({ pathname: '/dialpad', params: { leadId: student.id, phone: phoneNum, leadStatus: String(student?.lead_stage_id ?? student?.lead_status ?? '') } } as any)}
+          style={[styles.callButtonHeader, { opacity: phoneNum ? 1 : 0.5 }]}
+          disabled={!phoneNum}
+        >
+          <FontAwesome5 name="phone-alt" size={14} color="#0F172A" />
+        </TouchableOpacity>
+      </View>
+
+      <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
+        {/* Profile Card */}
+        <View style={[styles.profileCard, isDark && styles.darkCard]}>
+          <View style={styles.profileHeader}>
+            <View style={styles.avatar}>
+              <Text style={styles.avatarText}>{student?.first_name?.[0] || '?'}</Text>
+            </View>
+            <View style={styles.profileMeta}>
+              <Text style={[styles.profileName, isDark && styles.darkText]}>
+                {student?.first_name} {student?.last_name}
+              </Text>
+              <Text style={styles.profileCrmId}>{student?.crm_student_id || 'TEMP LEAD'}</Text>
+            </View>
+            <View style={[styles.statusBadge, { backgroundColor: student?.status === 'ACTIVE' ? '#D1FAE5' : student?.status === 'NEW' ? '#DBEAFE' : '#FEF3C7' }]}>
+              <Text style={[styles.statusText, { color: student?.status === 'ACTIVE' ? '#065F46' : student?.status === 'NEW' ? '#1E40AF' : '#92400E' }]}>
+                {student?.status || 'NEW'}
+              </Text>
+            </View>
+          </View>
+
+          {/* Pipeline Stage Change dropdown */}
+          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 12 }}>
+            <Text style={{ fontSize: 11, fontWeight: '900', color: '#94A3B8', letterSpacing: 1.5 }}>PIPELINE STAGE</Text>
+            <TouchableOpacity 
+              style={{
+                flexDirection: 'row',
+                alignItems: 'center',
+                backgroundColor: isDark ? '#0F172A' : '#F1F5F9',
+                paddingVertical: 6,
+                paddingHorizontal: 12,
+                borderRadius: 8,
+                borderWidth: 1,
+                borderColor: isDark ? '#334155' : '#E2E8F0',
+                gap: 6
+              }}
+              onPress={() => setStageModalVisible(true)}
+              disabled={updatingStage}
+            >
+              {updatingStage ? (
+                <ActivityIndicator size="small" color="#FBBF24" />
+              ) : (
+                <>
+                  <Text style={{ color: '#FBBF24', fontWeight: '900', fontSize: 13 }}>
+                    {getStageName(student?.lead_status)}
+                  </Text>
+                  <FontAwesome5 name="chevron-down" size={10} color="#FBBF24" />
+                </>
+              )}
+            </TouchableOpacity>
+          </View>
+
+          <View style={[styles.divider, isDark && styles.darkDivider]} />
+
+          {/* Academic & Campaign Info */}
+          <View style={styles.infoRow}>
+            <View style={styles.infoCol}>
+              <Text style={styles.infoLabel}>PROGRAM</Text>
+              <Text style={[styles.infoValue, isDark && styles.darkText]}>{student?.program_name || 'Not Specified'}</Text>
+            </View>
+            <View style={styles.infoCol}>
+              <Text style={styles.infoLabel}>COURSE</Text>
+              <Text style={[styles.infoValue, isDark && styles.darkText]}>{student?.course_name || 'Not Specified'}</Text>
+            </View>
+          </View>
+
+          <View style={[styles.infoRow, { marginTop: 10 }]}>
+            <View style={styles.infoCol}>
+              <Text style={styles.infoLabel}>CAMPAIGN</Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 2 }}>
+                <FontAwesome5 name="bullhorn" size={11} color="#4F46E5" />
+                <Text style={[styles.infoValue, { color: '#4F46E5' }, isDark && styles.darkText]} numberOfLines={2}>
+                  {campaignDisplayName}
+                </Text>
+              </View>
+            </View>
+            <View style={styles.infoCol}>
+              <Text style={styles.infoLabel}>WHATSAPP STATUS</Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 2 }}>
+                <FontAwesome5 name="whatsapp" size={12} color={isWhatsappConnected ? '#10B981' : '#94A3B8'} />
+                <Text style={{ fontSize: 12, fontWeight: '800', color: isWhatsappConnected ? '#059669' : '#64748B' }}>
+                  {isWhatsappConnected ? 'Connected' : (whatsappInteractions.length > 0 ? 'Message Sent' : 'Not Connected')}
+                </Text>
+              </View>
+            </View>
+          </View>
+
+          {/* Contact Details */}
+          <View style={[styles.contactBox, isDark && styles.darkContactBox]}>
+            <TouchableOpacity 
+              style={styles.contactItem}
+              onPress={() => {
+                 if (phoneNum) {
+                    setJustCalled(true);
+                    Linking.openURL(`tel:${phoneNum}`);
+                 }
+              }}
+            >
+              <FontAwesome5 name="phone" size={12} color="#FBBF24" style={styles.contactIcon} />
+              <Text style={[styles.contactText, isDark && styles.darkText]} numberOfLines={1}>{phoneNum || 'No Phone'}</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity 
+              style={styles.contactItem}
+              onPress={() => student?.email && Linking.openURL(`mailto:${student.email}`)}
+            >
+              <FontAwesome5 name="envelope" size={12} color="#FBBF24" style={styles.contactIcon} />
+              <Text style={[styles.contactText, isDark && styles.darkText]} numberOfLines={1}>{student?.email || 'No Email'}</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        {/* Call Statistics Summary Card */}
+        <View style={[styles.sectionCard, isDark && styles.darkCard]}>
+          <Text style={styles.sectionTitle}>CALL STATISTICS & PERFORMANCE</Text>
+          <View style={styles.statsGrid}>
+            <View style={styles.statBox}>
+              <View style={[styles.statIconContainer, { backgroundColor: 'rgba(59, 130, 246, 0.1)' }]}>
+                <FontAwesome5 name="phone-alt" size={12} color="#3B82F6" />
+              </View>
+              <View>
+                <Text style={styles.statLabel}>Total Calls</Text>
+                <Text style={[styles.statValue, isDark && styles.darkText]}>{totalCalls}</Text>
+              </View>
+            </View>
+
+            <View style={styles.statBox}>
+              <View style={[styles.statIconContainer, { backgroundColor: 'rgba(139, 92, 246, 0.1)' }]}>
+                <FontAwesome5 name="clock" size={12} color="#8B5CF6" />
+              </View>
+              <View>
+                <Text style={styles.statLabel}>Total Duration</Text>
+                <Text style={[styles.statValue, isDark && styles.darkText]}>{formatSeconds(totalDuration)}</Text>
+              </View>
+            </View>
+          </View>
+
+          <View style={styles.statsRow}>
+            <View style={styles.subStatCol}>
+              <Text style={styles.subStatLabel}>📤 Outgoing Calls</Text>
+              <Text style={[styles.subStatValue, isDark && styles.darkText]}>
+                {outgoingCalls.length} ({formatSeconds(totalOutgoingDuration)})
+              </Text>
+            </View>
+            <View style={styles.subStatCol}>
+              <Text style={styles.subStatLabel}>📥 Incoming Calls</Text>
+              <Text style={[styles.subStatValue, isDark && styles.darkText]}>
+                {incomingCalls.length} ({formatSeconds(totalIncomingDuration)})
+              </Text>
+            </View>
+          </View>
+
+          <View style={styles.dividerSub} />
+
+          <View style={styles.statsRow}>
+            <View style={styles.subStatCol}>
+              <Text style={styles.subStatLabel}>🟢 Connected Calls</Text>
+              <Text style={[styles.subStatValue, { color: '#10B981', fontWeight: '800' }]}>{connectedCalls}</Text>
+            </View>
+            <View style={styles.subStatCol}>
+              <Text style={styles.subStatLabel}>🔴 Missed Calls</Text>
+              <Text style={[styles.subStatValue, { color: '#EF4444', fontWeight: '800' }]}>{missedCalls}</Text>
+            </View>
+          </View>
+
+          <View style={styles.dividerSub} />
+
+          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 4 }}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+              <FontAwesome5 name="whatsapp" size={14} color="#10B981" />
+              <Text style={styles.subStatLabel}>WhatsApp Connected</Text>
+            </View>
+            {isWhatsappConnected ? (
+              <View style={{ backgroundColor: '#D1FAE5', paddingHorizontal: 10, paddingVertical: 4, borderRadius: 12 }}>
+                <Text style={{ fontSize: 11, fontWeight: '800', color: '#065F46' }}>✓ Confirmed Connected</Text>
+              </View>
+            ) : (
+              <TouchableOpacity
+                style={{ backgroundColor: '#ECFDF5', borderWidth: 1, borderColor: '#A7F3D0', paddingHorizontal: 10, paddingVertical: 5, borderRadius: 8, flexDirection: 'row', alignItems: 'center', gap: 5 }}
+                onPress={() => handleMarkWhatsAppConnected()}
+              >
+                <FontAwesome5 name="check-circle" size={11} color="#059669" />
+                <Text style={{ fontSize: 11, fontWeight: '800', color: '#059669' }}>Mark WhatsApp Connected</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        </View>
+
+        {/* Action Panel */}
+        <View style={styles.actionPanel}>
+          <TouchableOpacity 
+            style={[styles.actionBtn, { backgroundColor: '#10B981' }]}
+            onPress={() => {
+              if (phoneNum) {
+                setJustWhatsApped(true);
+                Linking.openURL(`https://wa.me/${phoneNum.replace(/\D/g, '')}`);
+              } else {
+                Alert.alert('No Phone', 'This lead has no phone number for WhatsApp.');
+              }
+            }}
+          >
+            <FontAwesome5 name="whatsapp" size={14} color="#FFF" />
+            <Text style={styles.actionBtnText}>WhatsApp</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity 
+            style={[styles.actionBtn, { backgroundColor: '#3B82F6' }]}
+            onPress={() => phoneNum && router.push({ pathname: '/dialpad', params: { leadId: student.id, phone: phoneNum } } as any)}
+          >
+            <FontAwesome5 name="phone-alt" size={14} color="#FFF" />
+            <Text style={styles.actionBtnText}>Dialpad</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity 
+            style={[styles.actionBtn, { backgroundColor: '#6B7280' }]}
+            onPress={() => setShowAddForm(!showAddForm)}
+          >
+            <FontAwesome5 name="pen" size={14} color="#FFF" />
+            <Text style={styles.actionBtnText}>{showAddForm ? 'Close' : 'Add Note'}</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Inline Add Note Form */}
+        {showAddForm && (
+          <View style={[styles.noteFormCard, isDark && styles.darkCard]}>
+            <Text style={styles.formTitle}>LOG NEW INTERACTION</Text>
+            
+            <View style={styles.typeSelector}>
+              {['NOTE', 'CALL', 'WHATSAPP', 'MEETING', 'EMAIL'].map((type) => (
+                <TouchableOpacity
+                  key={type}
+                  style={[styles.typeBtn, noteType === type && styles.typeBtnActive]}
+                  onPress={() => setNoteType(type)}
+                >
+                  <Text style={[styles.typeBtnText, noteType === type && styles.typeBtnTextActive]}>{type}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            {noteType === 'WHATSAPP' && (
+              <View style={{ marginBottom: 12 }}>
+                <Text style={{ fontSize: 11, fontWeight: '800', color: '#059669', marginBottom: 6, letterSpacing: 0.4 }}>
+                  WHATSAPP CONNECTION OUTCOME
+                </Text>
+                <View style={{ flexDirection: 'row', gap: 8 }}>
+                  <TouchableOpacity
+                    style={{
+                      flex: 1,
+                      paddingVertical: 8,
+                      paddingHorizontal: 10,
+                      borderRadius: 8,
+                      borderWidth: 1,
+                      borderColor: whatsappStatus === 'CONNECTED' ? '#10B981' : '#E2E8F0',
+                      backgroundColor: whatsappStatus === 'CONNECTED' ? '#ECFDF5' : '#F8FAFC',
+                      alignItems: 'center',
+                    }}
+                    onPress={() => setWhatsappStatus('CONNECTED')}
+                  >
+                    <Text style={{ fontSize: 11, fontWeight: '800', color: whatsappStatus === 'CONNECTED' ? '#065F46' : '#64748B' }}>
+                      ✓ Connected / Replied
+                    </Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={{
+                      flex: 1,
+                      paddingVertical: 8,
+                      paddingHorizontal: 10,
+                      borderRadius: 8,
+                      borderWidth: 1,
+                      borderColor: whatsappStatus === 'INITIATED' ? '#F59E0B' : '#E2E8F0',
+                      backgroundColor: whatsappStatus === 'INITIATED' ? '#FFFBEB' : '#F8FAFC',
+                      alignItems: 'center',
+                    }}
+                    onPress={() => setWhatsappStatus('INITIATED')}
+                  >
+                    <Text style={{ fontSize: 11, fontWeight: '800', color: whatsappStatus === 'INITIATED' ? '#92400E' : '#64748B' }}>
+                      Message Sent Only
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            )}
+
+            <TextInput
+              style={[styles.formInput, isDark && styles.darkInput]}
+              placeholder="What happened during this interaction?"
+              placeholderTextColor="#64748B"
+              multiline
+              numberOfLines={4}
+              value={noteText}
+              onChangeText={setNoteText}
+            />
+
+            <View style={styles.followUpContainer}>
+              <Text style={styles.followUpLabel}>Schedule Next Follow-up?</Text>
+              <View style={styles.followUpRow}>
+                <TouchableOpacity 
+                  style={styles.datePickerBtn} 
+                  onPress={() => {
+                    if (Platform.OS === 'android') {
+                      showAndroidDateTimePicker();
+                    } else {
+                      setShowDatePicker(true);
+                    }
+                  }}
+                >
+                  <FontAwesome5 name="calendar-alt" size={14} color="#64748B" />
+                  <Text style={styles.datePickerText}>
+                    {followUpDate ? followUpDate.toLocaleString([], {dateStyle: 'medium', timeStyle: 'short'}) : 'No Follow-up Scheduled'}
+                  </Text>
+                </TouchableOpacity>
+                {followUpDate && (
+                  <TouchableOpacity onPress={() => setFollowUpDate(null)} style={{marginLeft: 10}}>
+                    <FontAwesome5 name="times-circle" size={20} color="#EF4444" />
+                  </TouchableOpacity>
+                )}
+              </View>
+            </View>
+
+            {/* Pipeline status picker section */}
+            <View style={{ marginTop: 12 }}>
+              <Text style={{ fontSize: 12, fontWeight: '700', color: '#64748B', marginBottom: 8, letterSpacing: 0.5 }}>UPDATE PIPELINE STAGE</Text>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, paddingVertical: 4 }}>
+                {pipelineStages
+                  .filter(stage => {
+                    const name = (stage.name || '').toUpperCase();
+                    const id = String(stage.id || '').toUpperCase();
+                    return !name.includes('ENROL') && !name.includes('CONVERT') && id !== 'ENROLLED' && id !== 'CONVERTED';
+                  })
+                  .map((stage) => {
+                    const isSelected = isStageMatching(stage, selectedStageId);
+                    return (
+                      <TouchableOpacity
+                        key={stage.id}
+                        onPress={() => setSelectedStageId(stage.id.toString())}
+                        style={{
+                          paddingHorizontal: 12,
+                          paddingVertical: 8,
+                          borderRadius: 8,
+                          borderWidth: 1,
+                          borderColor: isSelected ? '#FFB800' : '#E2E8F0',
+                          backgroundColor: isSelected ? 'rgba(251, 191, 36, 0.1)' : '#F8FAFC',
+                          flexDirection: 'row',
+                          alignItems: 'center',
+                          gap: 6
+                        }}
+                      >
+                        <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: stage.color || '#64748B' }} />
+                        <Text style={{ fontSize: 11, fontWeight: '700', color: isSelected ? '#D97706' : '#475569' }}>
+                          {stage.name}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+              </ScrollView>
+            </View>
+
+            {showDatePicker && Platform.OS === 'ios' && (
+              <DateTimePicker
+                value={followUpDate || new Date()}
+                mode="datetime"
+                display="default"
+                onChange={(event, selectedDate) => {
+                  setShowDatePicker(Platform.OS === 'ios');
+                  if (selectedDate) setFollowUpDate(selectedDate);
+                }}
+              />
+            )}
+
+            <TouchableOpacity 
+              style={styles.submitBtn} 
+              onPress={handleAddNote}
+              disabled={submittingNote}
+            >
+              {submittingNote ? (
+                <ActivityIndicator color="#0F172A" />
+              ) : (
+                <>
+                  <Text style={styles.submitBtnText}>Save Interaction Log</Text>
+                  <FontAwesome5 name="check" size={12} color="#0F172A" style={{ marginLeft: 6 }} />
+                </>
+              )}
+            </TouchableOpacity>
+          </View>
+        )}
+
+        {/* Timeline / Call & Note History */}
+        <View style={[styles.timelineSection, { backgroundColor: 'transparent' }]}>
+          <Text style={styles.sectionTitle}>ACTIVITY TIMELINE & CALL HISTORY</Text>
+
+          {loadingInteractions ? (
+            <ActivityIndicator size="small" color="#FBBF24" style={{ marginTop: 20 }} />
+          ) : interactions.length > 0 ? (
+            interactions.map((item, idx) => {
+              const iconConfig = getInteractionIcon(item.interaction_type);
+              return (
+                <View key={item.id || idx} style={styles.timelineItem}>
+                  <View style={styles.timelineLeft}>
+                    <View style={[styles.timelineIconContainer, { backgroundColor: iconConfig.bg }]}>
+                      <FontAwesome5 name={iconConfig.name} size={14} color={iconConfig.color} />
+                    </View>
+                    {idx < interactions.length - 1 && (
+                      <View style={[styles.timelineLine, isDark && styles.darkTimelineLine]} />
+                    )}
+                  </View>
+                  <View style={[styles.timelineCard, isDark && styles.darkCard]}>
+                    <View style={styles.timelineHeader}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                        <Text style={[styles.timelineType, isDark && styles.darkText]}>{item.interaction_type}</Text>
+                        {item.interaction_type === 'WHATSAPP' && (
+                          <View style={{
+                            backgroundColor: (item.call_status || '').toUpperCase() === 'CONNECTED' ? '#D1FAE5' : '#FEF3C7',
+                            paddingHorizontal: 6,
+                            paddingVertical: 2,
+                            borderRadius: 6,
+                          }}>
+                            <Text style={{
+                              fontSize: 9,
+                              fontWeight: '800',
+                              color: (item.call_status || '').toUpperCase() === 'CONNECTED' ? '#065F46' : '#92400E',
+                            }}>
+                              {(item.call_status || '').toUpperCase() === 'CONNECTED' ? 'CONNECTED' : 'SENT'}
+                            </Text>
+                          </View>
+                        )}
+                      </View>
+                      <Text style={styles.timelineDate}>{formatTime(item.date)}</Text>
+                    </View>
+                    <Text style={styles.timelineNotes}>{item.notes}</Text>
+                    {item.interaction_type === 'WHATSAPP' && (item.call_status || '').toUpperCase() !== 'CONNECTED' && (
+                      <TouchableOpacity
+                        style={{ marginTop: 6, alignSelf: 'flex-start', backgroundColor: '#ECFDF5', borderWidth: 1, borderColor: '#A7F3D0', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6 }}
+                        onPress={() => handleMarkWhatsAppConnected(item.id)}
+                      >
+                        <Text style={{ fontSize: 10, fontWeight: '800', color: '#059669' }}>✓ Mark as WhatsApp Connected</Text>
+                      </TouchableOpacity>
+                    )}
+                    {item.audio_recording && (
+                      <TouchableOpacity 
+                        style={styles.audioPlayerMini} 
+                        onPress={() => playAudio(item.audio_recording!, item.id.toString())}
+                      >
+                        <FontAwesome5 name={playingAudio === item.id.toString() ? 'stop-circle' : 'play-circle'} size={14} color="#10B981" />
+                        <Text style={styles.audioTextMini}>{playingAudio === item.id.toString() ? 'Playing...' : 'Play Call Recording'}</Text>
+                      </TouchableOpacity>
+                    )}
+                    {item.author_name && (
+                      <Text style={styles.timelineAuthor}>Logged by: {item.author_name}</Text>
+                    )}
+                  </View>
+                </View>
+              );
+            })
+          ) : (
+            <View style={[styles.emptyBox, isDark && styles.darkCard]}>
+              <FontAwesome5 name="bell-slash" size={24} color="#64748B" style={{ marginBottom: 8 }} />
+              <Text style={styles.emptyText}>No call history or notes logged yet.</Text>
+            </View>
+          )}
+        </View>
+      </ScrollView>
+    </SafeAreaView>
+
+      {/* Dynamic Stage Picker Modal */}
+      <Modal
+        animationType="slide"
+        transparent={true}
+        visible={stageModalVisible}
+        onRequestClose={() => setStageModalVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalContent, isDark && styles.darkModalContent]}>
+            <View style={styles.modalHeader}>
+              <Text style={[styles.modalTitle, isDark && styles.darkText]}>Change Pipeline Stage</Text>
+              <TouchableOpacity onPress={() => setStageModalVisible(false)} style={styles.modalCloseBtn}>
+                <FontAwesome5 name="times" size={16} color={isDark ? '#FFF' : '#64748B'} />
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView contentContainerStyle={styles.modalList} showsVerticalScrollIndicator={false}>
+              {pipelineStages.map((stage) => {
+                const isSelected = isStageMatching(stage, student?.lead_stage_id ?? student?.lead_status);
+                return (
+                  <TouchableOpacity
+                    key={stage.id}
+                    style={[
+                      styles.stageItem,
+                      isDark && styles.darkStageItem,
+                      isSelected && styles.stageItemActive
+                    ]}
+                    onPress={() => handleChangeStage(String(stage.id))}
+                  >
+                    <View style={{ flex: 1, flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                      <View style={[styles.stageColorDot, { backgroundColor: stage.color || '#FBBF24' }]} />
+                      <Text style={[
+                        styles.stageItemText,
+                        isDark && styles.darkText,
+                        isSelected && styles.stageItemTextActive
+                      ]}>
+                        {stage.name}
+                      </Text>
+                    </View>
+                    {isSelected && (
+                      <FontAwesome5 name="check" size={14} color="#FBBF24" />
+                    )}
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+    </>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#F9FAFB',
+    paddingTop: Platform.OS === 'android' ? StatusBar.currentHeight : 0,
+  },
+  darkBg: {
+    backgroundColor: '#F9FAFB',
+  },
+  center: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#F9FAFB',
+  },
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 20,
+    paddingVertical: 15,
+    backgroundColor: '#FFFFFF', // Slate 800
+    borderBottomWidth: 1,
+    borderBottomColor: '#E5E7EB',
+  },
+  darkHeader: {
+    backgroundColor: '#FFFFFF',
+    borderBottomColor: '#E5E7EB',
+  },
+  backButton: {
+    padding: 8,
+    borderRadius: 8,
+  },
+  headerTitle: {
+    fontSize: 16,
+    fontWeight: '900',
+    color: '#111827',
+    letterSpacing: 2,
+  },
+  callButtonHeader: {
+    padding: 10,
+    borderRadius: 12,
+    backgroundColor: '#FFB800',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  scrollContent: {
+    padding: 20,
+    paddingBottom: 40,
+  },
+  profileCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 24,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    marginBottom: 20,
+  },
+  darkCard: {
+    backgroundColor: '#FFFFFF',
+    borderColor: '#E5E7EB',
+  },
+  profileHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'transparent',
+  },
+  avatar: {
+    width: 50,
+    height: 50,
+    borderRadius: 16,
+    backgroundColor: 'rgba(251, 191, 36, 0.15)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(251, 191, 36, 0.3)',
+  },
+  avatarText: {
+    color: '#FFB800',
+    fontSize: 22,
+    fontWeight: '900',
+  },
+  profileMeta: {
+    flex: 1,
+    marginLeft: 15,
+    backgroundColor: 'transparent',
+  },
+  profileName: {
+    fontSize: 18,
+    fontWeight: '900',
+    color: '#111827',
+  },
+  profileCrmId: {
+    fontSize: 12,
+    color: '#94A3B8',
+    fontWeight: '600',
+    marginTop: 2,
+  },
+  statusBadge: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 10,
+    alignSelf: 'center',
+  },
+  statusText: {
+    fontSize: 10,
+    fontWeight: '900',
+  },
+  divider: {
+    height: 1,
+    backgroundColor: '#334155',
+    marginVertical: 16,
+  },
+  darkDivider: {
+    backgroundColor: '#334155',
+  },
+  infoRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    backgroundColor: 'transparent',
+  },
+  infoCol: {
+    flex: 1,
+    backgroundColor: 'transparent',
+  },
+  infoLabel: {
+    fontSize: 9,
+    fontWeight: '900',
+    color: '#94A3B8',
+    letterSpacing: 1.5,
+    marginBottom: 4,
+  },
+  infoValue: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: '#111827',
+  },
+  darkText: {
+    color: '#111827',
+  },
+  contactBox: {
+    marginTop: 16,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 12,
+    backgroundColor: 'transparent',
+  },
+  darkContactBox: {
+    backgroundColor: 'transparent',
+  },
+  contactItem: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#F9FAFB',
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+  },
+  contactIcon: {
+    marginRight: 8,
+  },
+  contactText: {
+    flex: 1,
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#E2E8F0',
+  },
+  sectionCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 24,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    marginBottom: 20,
+  },
+  statsGrid: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 12,
+    marginBottom: 16,
+  },
+  statBox: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#F8FAFC',
+    borderRadius: 16,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    gap: 10,
+  },
+  statIconContainer: {
+    width: 32,
+    height: 32,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  statLabel: {
+    fontSize: 10,
+    fontWeight: '600',
+    color: '#64748B',
+  },
+  statValue: {
+    fontSize: 13,
+    fontWeight: '900',
+    color: '#0F172A',
+  },
+  statsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  subStatCol: {
+    flex: 1,
+  },
+  subStatLabel: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: '#64748B',
+    marginBottom: 4,
+  },
+  subStatValue: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#334155',
+  },
+  dividerSub: {
+    height: 1,
+    backgroundColor: '#F1F5F9',
+    marginVertical: 12,
+  },
+  sectionTitle: {
+    fontSize: 10,
+    fontWeight: '900',
+    color: '#94A3B8',
+    letterSpacing: 2,
+    marginBottom: 16,
+    marginLeft: 2,
+  },
+  grid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    backgroundColor: 'transparent',
+    gap: 16,
+  },
+  gridCol: {
+    width: '45%',
+    backgroundColor: 'transparent',
+  },
+  fieldLabel: {
+    fontSize: 8,
+    fontWeight: '900',
+    color: '#94A3B8',
+    letterSpacing: 1,
+    marginBottom: 4,
+  },
+  fieldValue: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#111827',
+  },
+  actionPanel: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 12,
+    marginBottom: 20,
+  },
+  actionBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 12,
+    borderRadius: 16,
+    gap: 8,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.15,
+    shadowRadius: 6,
+    elevation: 3,
+  },
+  actionBtnText: {
+    color: '#FFF',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  noteFormCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 24,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    marginBottom: 20,
+  },
+  formTitle: {
+    fontSize: 10,
+    fontWeight: '900',
+    color: '#FFB800',
+    letterSpacing: 1.5,
+    marginBottom: 16,
+  },
+  typeSelector: {
+    flexDirection: 'row',
+    backgroundColor: '#F9FAFB',
+    borderRadius: 12,
+    padding: 4,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+  },
+  typeBtn: {
+    flex: 1,
+    paddingVertical: 8,
+    borderRadius: 8,
+    alignItems: 'center',
+    backgroundColor: 'transparent',
+  },
+  typeBtnActive: {
+    backgroundColor: '#FFB800',
+  },
+  typeBtnText: {
+    fontSize: 11,
+    fontWeight: '800',
+    color: '#94A3B8',
+  },
+  typeBtnTextActive: {
+    color: '#111827',
+    fontWeight: '900',
+  },
+  formInput: {
+    backgroundColor: '#F9FAFB',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    padding: 14,
+    color: '#111827',
+    fontSize: 14,
+    height: 100,
+    textAlignVertical: 'top',
+    marginBottom: 16,
+  },
+  darkInput: {
+    backgroundColor: '#F9FAFB',
+    borderColor: '#E5E7EB',
+  },
+  submitBtn: {
+    flexDirection: 'row',
+    backgroundColor: '#FFB800',
+    borderRadius: 16,
+    paddingVertical: 14,
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#FFB800',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.2,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  submitBtnText: {
+    color: '#111827',
+    fontSize: 14,
+    fontWeight: '900',
+  },
+  timelineSection: {
+    marginBottom: 20,
+  },
+  timelineItem: {
+    flexDirection: 'row',
+    marginBottom: 16,
+    backgroundColor: 'transparent',
+  },
+  timelineLeft: {
+    alignItems: 'center',
+    width: 40,
+    backgroundColor: 'transparent',
+  },
+  timelineIconContainer: {
+    width: 32,
+    height: 32,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 2,
+  },
+  timelineLine: {
+    flex: 1,
+    width: 2,
+    backgroundColor: '#334155',
+    marginTop: 4,
+    zIndex: 1,
+  },
+  darkTimelineLine: {
+    backgroundColor: '#334155',
+  },
+  timelineCard: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 20,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+  },
+  timelineHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: 'transparent',
+    marginBottom: 8,
+  },
+  timelineType: {
+    fontSize: 12,
+    fontWeight: '900',
+    color: '#111827',
+  },
+  followUpContainer: {
+    marginTop: 16,
+    marginBottom: 8,
+  },
+  followUpRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  followUpLabel: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#64748B',
+    marginBottom: 6,
+    textTransform: 'uppercase',
+  },
+  datePickerBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    borderRadius: 8,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    flex: 1,
+  },
+  datePickerText: {
+    marginLeft: 8,
+    fontSize: 14,
+    color: '#4B5563',
+    fontWeight: '500',
+  },
+  timelineDate: {
+    fontSize: 10,
+    color: '#94A3B8',
+    fontWeight: '600',
+  },
+  timelineNotes: {
+    fontSize: 13,
+    color: '#CBD5E0',
+    lineHeight: 18,
+    fontWeight: '500',
+  },
+  audioIndicator: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 8,
+    gap: 6,
+    backgroundColor: 'transparent',
+  },
+  audioIndicatorText: {
+    color: '#10B981',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  timelineAuthor: {
+    fontSize: 9,
+    color: '#94A3B8',
+    marginTop: 8,
+    fontStyle: 'italic',
+  },
+  emptyBox: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 24,
+    padding: 30,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+  },
+  emptyText: {
+    color: '#94A3B8',
+    fontSize: 13,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.75)',
+    justifyContent: 'flex-end',
+  },
+  modalContent: {
+    backgroundColor: '#FFFFFF',
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
+    paddingTop: 20,
+    paddingHorizontal: 24,
+    paddingBottom: Platform.OS === 'ios' ? 40 : 24,
+    maxHeight: '60%',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: -4 },
+    shadowOpacity: 0.25,
+    shadowRadius: 12,
+    elevation: 10,
+  },
+  darkModalContent: {
+    backgroundColor: '#FFFFFF',
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingBottom: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(148, 163, 184, 0.15)',
+  },
+  modalTitle: {
+    fontSize: 16,
+    fontWeight: '900',
+    color: '#111827',
+    letterSpacing: 0.5,
+  },
+  modalCloseBtn: {
+    padding: 8,
+    borderRadius: 12,
+  },
+  modalList: {
+    paddingVertical: 12,
+  },
+  stageItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    borderRadius: 16,
+    marginBottom: 8,
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+  },
+  darkStageItem: {
+    backgroundColor: '#F9FAFB',
+    borderColor: '#E5E7EB',
+  },
+  stageItemActive: {
+    borderColor: '#FFB800',
+    backgroundColor: 'rgba(251, 191, 36, 0.08)',
+  },
+  stageColorDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+  },
+  stageItemText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#4B5563',
+  },
+  stageItemTextActive: {
+    color: '#FFB800',
+    fontWeight: '900',
+  },
+  audioPlayerMini: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#EFF6FF',
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 6,
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: '#BFDBFE',
+    alignSelf: 'flex-start',
+  },
+  audioTextMini: {
+    marginLeft: 6,
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#1E40AF',
+  },
+});

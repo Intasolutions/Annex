@@ -1,0 +1,897 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { View, Text, StyleSheet, TouchableOpacity, Modal, TextInput, Platform, ScrollView, Alert, ActivityIndicator, Animated } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
+import { listenToCallState, listenToMissedCalls, startNativeRecording, stopNativeRecording, cancelNativeRecording, findRecentRecordingInMappedFolder, markCallSessionEnded, getLastCallSessionEndTimeMs, getLatestCallLogDuration, extractDurationFromAudio } from '../utils/CallManager';
+import { generateMobileCallId, queueOfflineCall, markRecordingConsumed, getConsumedRecordings, isRecordingConsumed, uploadCallRecordingAsync } from '../utils/SyncManager';
+import client from '../api/client';
+import * as DocumentPicker from 'expo-document-picker';
+import DateTimePicker from '@react-native-community/datetimepicker';
+import * as Notifications from 'expo-notifications';
+
+export default function GlobalCallListener() {
+  const [isModalVisible, setIsModalVisible] = useState(false);
+  // ── Bug 1 Fix: Live ringing banner state ──
+  const [showRingingBanner, setShowRingingBanner] = useState(false);
+  const [ringingPhone, setRingingPhone] = useState('');
+  const [ringingLeadInfo, setRingingLeadInfo] = useState<any>(null);
+  const [loadingRingingLead, setLoadingRingingLead] = useState(false);
+  const bannerAnim = useRef(new Animated.Value(-120)).current;
+
+  const [displayPhone, setDisplayPhone] = useState('');
+  const [callDuration, setCallDuration] = useState(0);
+  const [callStatusState, setCallStatusState] = useState<'CONNECTED' | 'MISSED'>('MISSED');
+  const [recordedFilePath, setRecordedFilePath] = useState<string | null>(null);
+  
+  const [leadInfo, setLeadInfo] = useState<any>(null); 
+  const [loadingLead, setLoadingLead] = useState(false);
+  
+  const [pipelineStages, setPipelineStages] = useState<any[]>([]);
+  const [pipelineStatus, setPipelineStatus] = useState('');
+  const [hasExplicitStageChange, setHasExplicitStageChange] = useState(false);
+  const [postCallNotes, setPostCallNotes] = useState('');
+  const [nextFollowupDate, setNextFollowupDate] = useState<Date | null>(null);
+  const [showDatePicker, setShowDatePicker] = useState(false);
+  const [manualRecordingFile, setManualRecordingFile] = useState<any>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Refs for background state tracking
+  const isIncomingRef = useRef(false);
+  const isOffhookRef = useRef(false);
+  const incomingPhoneRef = useRef<string | null>(null);
+  const callStartTimeRef = useRef<number | null>(null);
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    fetchPipelineStages();
+
+    const unsubscribeMissed = listenToMissedCalls(async (event) => {
+      console.log('GlobalCallListener Missed Call Event:', event);
+      const phone = event.phoneNumber;
+      if (!phone) return;
+
+      const mobileCallId = generateMobileCallId(phone, 'INCOMING');
+      let student = null;
+
+      try {
+        // Attempt secondary lead lookup
+        const cleanPhone = phone.replace(/\D/g, '').slice(-10);
+        const res = await client.get('/core/students/', { params: { search: cleanPhone } });
+        const results = res.data?.results || res.data || [];
+        if (results.length > 0) student = results[0];
+      } catch (_) {}
+
+      try {
+        const payload = new FormData();
+        if (student?.id) payload.append('student', String(student.id));
+        payload.append('mobile_call_id', mobileCallId);
+        payload.append('customer_number', phone);
+        payload.append('caller_number', phone);
+        payload.append('interaction_type', 'CALL');
+        payload.append('call_direction', 'INCOMING');
+        payload.append('call_status', 'MISSED');
+        payload.append('call_duration', '0');
+        payload.append('notes', `Missed incoming call from ${phone}`);
+
+        await client.post('/crm/interactions/', payload, {
+          headers: { 'Content-Type': 'multipart/form-data' }
+        });
+
+        Alert.alert(
+          '🚨 Missed Call Alert',
+          student 
+            ? `Missed call from ${student.first_name || ''} ${student.last_name || ''} (${phone}). Logged to CRM.`
+            : `Missed call from ${phone}. Logged to CRM.`
+        );
+      } catch (err) {
+        console.warn('Failed to upload missed call online, queueing offline:', err);
+        await queueOfflineCall({
+          mobile_call_id: mobileCallId,
+          student: student?.id,
+          customer_number: phone,
+          caller_number: phone,
+          call_direction: 'INCOMING',
+          call_status: 'MISSED',
+          call_duration: 0,
+          notes: `Missed incoming call from ${phone}`
+        });
+      }
+    });
+
+    const unsubscribe = listenToCallState(async (event) => {
+      console.log('GlobalCallListener State Event:', event);
+      const { state, phoneNumber } = event;
+
+      if (state === 'RINGING') {
+        // Ensure no active timer is running during ringing/incoming alerts
+        stopTimer();
+        isIncomingRef.current = true;
+        isOffhookRef.current = false;
+        incomingPhoneRef.current = phoneNumber;
+        callStartTimeRef.current = null;
+        setDisplayPhone(phoneNumber);
+        setRingingPhone(phoneNumber || 'Unknown Number');
+        setRingingLeadInfo(null);
+        setShowRingingBanner(true);
+        // Animate banner sliding in from top
+        Animated.spring(bannerAnim, {
+          toValue: 0,
+          useNativeDriver: true,
+          tension: 80,
+          friction: 10,
+        }).start();
+
+        // Pre-fetch CRM lead info while phone is ringing
+        if (phoneNumber) {
+          fetchLeadInfo(phoneNumber);
+          // Also update the ringing banner's lead lookup
+          setLoadingRingingLead(true);
+          try {
+            const cleanPhone = phoneNumber.replace(/\D/g, '').slice(-10);
+            const res = await client.get('/core/students/', { params: { search: cleanPhone } });
+            const data = res.data?.results || res.data || [];
+            if (data.length > 0) setRingingLeadInfo(data[0]);
+          } catch (_) {}
+          finally { setLoadingRingingLead(false); }
+        }
+      } 
+      else if (state === 'OFFHOOK') {
+        // Incoming call was answered — hide banner, start UI timer
+        if (isIncomingRef.current) {
+          isOffhookRef.current = true;
+          // Slide banner out
+          Animated.timing(bannerAnim, {
+            toValue: -120,
+            duration: 250,
+            useNativeDriver: true,
+          }).start(() => setShowRingingBanner(false));
+
+          callStartTimeRef.current = Date.now();
+          startTimer();
+          
+          if (Platform.OS === 'android') {
+            const path = await startNativeRecording(incomingPhoneRef.current || "");
+            console.log("Global incoming call recording fallback:", path);
+          }
+        }
+      } 
+      else if (state === 'IDLE') {
+        // Stop timer IMMEDIATELY on IDLE before ANY asynchronous CallLog/recording processing
+        stopTimer();
+
+        // Call ended (answered or missed) — hide banner, show post-call modal
+        Animated.timing(bannerAnim, {
+          toValue: -120,
+          duration: 250,
+          useNativeDriver: true,
+        }).start(() => setShowRingingBanner(false));
+
+        if (isIncomingRef.current) {
+          const endTime = Date.now();
+          const rawStart = callStartTimeRef.current || (Date.now() - 5000);
+          const startTime = Math.max(rawStart, getLastCallSessionEndTimeMs());
+          const wasOffhook = isOffhookRef.current;
+          const phone = incomingPhoneRef.current || displayPhone;
+
+          let authoritativeDuration = 0;
+          let isConnected = false;
+
+          if (wasOffhook && startTime) {
+            if (Platform.OS === 'android' && phone) {
+              try {
+                const logDuration = await getLatestCallLogDuration(phone, startTime, 'INCOMING');
+                if (typeof logDuration === 'number' && logDuration > 0) {
+                  authoritativeDuration = logDuration;
+                  isConnected = true;
+                } else {
+                  authoritativeDuration = 0;
+                  isConnected = false;
+                }
+              } catch (err) {
+                console.warn('[GlobalCallListener] Failed to query CallLog duration:', err);
+                authoritativeDuration = 0;
+                isConnected = false;
+              }
+            }
+          }
+
+          if (Platform.OS === 'android' && wasOffhook && isConnected && authoritativeDuration > 0) {
+            const consumedSet = await getConsumedRecordings();
+            let path = await stopNativeRecording();
+            if (path && isRecordingConsumed(path, consumedSet)) {
+              path = null;
+            }
+            if (!path && phone) {
+              path = await findRecentRecordingInMappedFolder(phone, startTime, endTime, consumedSet);
+            }
+            if (path && !isRecordingConsumed(path, consumedSet)) {
+              setRecordedFilePath(path);
+              const exactDuration = await extractDurationFromAudio(path);
+              if (exactDuration && exactDuration > 0) {
+                authoritativeDuration = exactDuration;
+              }
+            } else {
+              setRecordedFilePath(null);
+            }
+          } else if (Platform.OS === 'android') {
+            await cancelNativeRecording();
+            setRecordedFilePath(null);
+          }
+
+          markCallSessionEnded(Date.now());
+
+          // Unified rule: duration > 0 -> CONNECTED, duration == 0 -> MISSED
+          const finalDuration = isConnected && authoritativeDuration > 0 ? authoritativeDuration : 0;
+          const finalStatus = finalDuration > 0 ? 'CONNECTED' : 'MISSED';
+
+          setCallDuration(finalDuration);
+          setCallStatusState(finalStatus);
+          setManualRecordingFile(null);
+          setPostCallNotes('');
+          setNextFollowupDate(null);
+          
+          // Show post-call review modal
+          setIsModalVisible(true);
+        }
+        
+        // Reset tracking refs
+        isIncomingRef.current = false;
+        isOffhookRef.current = false;
+        callStartTimeRef.current = null;
+        incomingPhoneRef.current = null;
+      }
+    });
+
+    return () => {
+      unsubscribe();
+      unsubscribeMissed();
+      stopTimer();
+    };
+  }, []);
+
+  const isStageMatching = (stage: any, statusVal: any) => {
+    if (!stage || statusVal === null || statusVal === undefined || String(statusVal).trim() === '') return false;
+    const raw = String(statusVal).trim();
+    if (String(stage.id) === raw) return true;
+    const normVal = raw.toLowerCase().replace(/[\s_-]+/g, '');
+    const normName = String(stage.name || '').trim().toLowerCase().replace(/[\s_-]+/g, '');
+    const normId = String(stage.id || '').trim().toLowerCase().replace(/[\s_-]+/g, '');
+    if (normVal === normName || normVal === normId) return true;
+    const aliases: Record<string, string[]> = {
+      new: ['new', 'newlead'],
+      newlead: ['new', 'newlead'],
+      followup: ['followup', 'followups'],
+      paymentpending: ['paymentpending', 'pendingpayment'],
+      enrolled: ['enrolled', 'converted'],
+      converted: ['converted', 'enrolled'],
+      dropped: ['dropped', 'notinterested', 'rejected', 'lost'],
+    };
+    const group = aliases[normVal] || [];
+    return group.includes(normName) || group.includes(normId);
+  };
+
+  const fetchPipelineStages = async () => {
+    try {
+      const res = await client.get('/crm/stages/');
+      const data = res.data?.results || res.data || [];
+      if (data.length > 0) {
+        setPipelineStages(data);
+      }
+    } catch (e) {
+      console.log('Failed to fetch pipeline stages:', e);
+    }
+  };
+
+  const fetchLeadInfo = async (phone: string) => {
+    setLoadingLead(true);
+    setHasExplicitStageChange(false);
+    try {
+      // Clean phone to search
+      const cleanPhone = phone.replace(/\D/g, '').slice(-10); // get last 10 digits
+      const res = await client.get('/core/students/', { params: { search: cleanPhone } });
+      const data = res.data?.results || res.data || [];
+      
+      if (data.length > 0) {
+        setLeadInfo(data[0]); // match found!
+        const currentStage = data[0]?.lead_stage_id ?? data[0]?.lead_status;
+        setPipelineStatus(currentStage !== undefined && currentStage !== null ? String(currentStage) : '');
+      } else {
+        setLeadInfo(null); // Unknown caller
+        setPipelineStatus('');
+      }
+    } catch (err) {
+      console.log('Failed to find lead globally:', err);
+      setLeadInfo(null);
+      setPipelineStatus('');
+    } finally {
+      setLoadingLead(false);
+    }
+  };
+
+  const startTimer = () => {
+    stopTimer();
+    setCallDuration(0);
+    timerRef.current = setInterval(() => {
+      if (callStartTimeRef.current) {
+        setCallDuration(Math.max(0, Math.floor((Date.now() - callStartTimeRef.current) / 1000)));
+      } else {
+        setCallDuration(prev => prev + 1);
+      }
+    }, 1000);
+  };
+
+  const stopTimer = () => {
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+  };
+
+  const handleSaveCall = async () => {
+    if (isSubmitting) return;
+    setIsSubmitting(true);
+
+    const mobileCallId = generateMobileCallId(displayPhone, 'INCOMING');
+    
+    // UNIFIED RULE:
+    // duration > 0 -> CONNECTED
+    // duration == 0 -> MISSED
+    const isConnected = callDuration > 0 && callStatusState === 'CONNECTED';
+    const status = isConnected ? 'CONNECTED' : 'MISSED';
+    const finalDuration = isConnected ? callDuration.toString() : '0';
+    const notesContent = postCallNotes
+      ? `Incoming Call - Duration: ${formatDuration(callDuration)}\nNotes: ${postCallNotes}`
+      : (isConnected ? `Incoming Call from ${displayPhone} (CONNECTED, ${formatDuration(callDuration)})` : `Missed Incoming Call from ${displayPhone}`);
+
+    const parameters: Record<string, string> = {
+      mobile_call_id: mobileCallId,
+      customer_number: displayPhone,
+      caller_number: displayPhone,
+      interaction_type: 'CALL',
+      call_duration: finalDuration,
+      call_direction: 'INCOMING',
+      call_status: status,
+      notes: notesContent,
+    };
+    if (leadInfo?.id) parameters.student = leadInfo.id.toString();
+    if (hasExplicitStageChange && pipelineStatus && leadInfo?.id) {
+      parameters.pipeline_status = String(pipelineStatus);
+    }
+    if (nextFollowupDate && leadInfo?.id) {
+      parameters.next_followup_date = nextFollowupDate.toISOString();
+    }
+
+    let fileUriToUpload: string | null = null;
+    let mimeType = 'audio/m4a';
+    let fileName = `incoming_record_${Date.now()}.m4a`;
+
+    if (isConnected && recordedFilePath) {
+      fileUriToUpload = recordedFilePath;
+      if (!fileUriToUpload.startsWith('file://') && !fileUriToUpload.startsWith('content://')) {
+        fileUriToUpload = `file://${fileUriToUpload}`;
+      }
+      const extMatch = fileUriToUpload.match(/\.([a-zA-Z0-9]+)$/);
+      const ext = extMatch ? extMatch[1].toLowerCase() : 'm4a';
+      if (ext === 'mp3') mimeType = 'audio/mpeg';
+      else if (ext === 'wav') mimeType = 'audio/wav';
+      else if (ext === 'amr') mimeType = 'audio/amr';
+      else if (ext === 'aac') mimeType = 'audio/aac';
+
+      const cleanPhone = (displayPhone || '').replace(/\D/g, '').slice(-10);
+      fileName = `incoming_record_${cleanPhone ? cleanPhone + '_' : ''}${Date.now()}.${ext}`;
+    } else if (isConnected && manualRecordingFile) {
+      fileUriToUpload = manualRecordingFile.uri;
+      mimeType = manualRecordingFile.mimeType || 'audio/mpeg';
+      const cleanPhone = (displayPhone || '').replace(/\D/g, '').slice(-10);
+      fileName = manualRecordingFile.name || `record_${cleanPhone ? cleanPhone + '_' : ''}${Date.now()}.mp3`;
+    }
+
+    try {
+      // 1. Post lightweight metadata to create the interaction record promptly (< 200ms)
+      const res = await client.post('/crm/interactions/', parameters);
+      const serverInteractionId = res.data?.id;
+
+      // 2. If there is an audio recording, kick off asynchronous background upload
+      if (fileUriToUpload && serverInteractionId) {
+        uploadCallRecordingAsync({
+          interactionId: serverInteractionId,
+          mobileCallId,
+          fileUri: fileUriToUpload,
+          mimeType,
+          fileName,
+        }).catch((err) => {
+          console.warn('[GlobalCallListener] Asynchronous recording upload error:', err);
+        });
+
+        Alert.alert('✅ Saved', 'Call logged to CRM. Audio recording is uploading in the background.');
+      } else {
+        Alert.alert('✅ Saved', 'Call logged to CRM successfully.');
+      }
+
+      if (nextFollowupDate && leadInfo?.id) {
+        const msUntilFollowup = nextFollowupDate.getTime() - Date.now();
+        if (msUntilFollowup > 0) {
+          const leadName = `${leadInfo.first_name || ''} ${leadInfo.last_name || ''}`.trim() || displayPhone;
+          try {
+            await Notifications.scheduleNotificationAsync({
+              content: {
+                title: 'Follow-up Reminder',
+                body: `Follow up with ${leadName}`,
+                sound: true,
+              },
+              trigger: {
+                type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
+                seconds: Math.max(1, Math.floor(msUntilFollowup / 1000)),
+              },
+            });
+          } catch (_) {}
+        }
+      }
+
+      resetModal();
+    } catch (error: any) {
+      console.warn('Failed to upload incoming call log online, queueing offline:', error?.response?.data || error);
+      await queueOfflineCall({
+        mobile_call_id: mobileCallId,
+        student: leadInfo?.id,
+        customer_number: displayPhone,
+        caller_number: displayPhone,
+        call_direction: 'INCOMING',
+        call_status: status,
+        call_duration: isConnected ? callDuration : 0,
+        notes: postCallNotes 
+          ? `Incoming Call - Duration: ${formatDuration(callDuration)}\nNotes: ${postCallNotes}` 
+          : (isConnected ? `Incoming Call from ${displayPhone} (CONNECTED, ${formatDuration(callDuration)})` : `Missed Incoming Call from ${displayPhone}`),
+        pipeline_status: hasExplicitStageChange && pipelineStatus ? String(pipelineStatus) : undefined,
+        next_followup_date: nextFollowupDate?.toISOString(),
+        recordedFilePath: isConnected ? recordedFilePath : null
+      });
+      Alert.alert('Saved Offline', 'Call logged locally and will sync automatically.');
+      resetModal();
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const resetModal = () => {
+    stopTimer();
+    setIsModalVisible(false);
+    setPostCallNotes('');
+    setPipelineStatus('');
+    setHasExplicitStageChange(false);
+    setRecordedFilePath(null);
+    setManualRecordingFile(null);
+    setNextFollowupDate(null);
+    setLeadInfo(null);
+    setDisplayPhone('');
+    setCallDuration(0);
+    setCallStatusState('MISSED');
+  };
+
+  const pickRecordingFile = async () => {
+    try {
+      if (callStatusState !== 'CONNECTED' || callDuration <= 0) {
+        Alert.alert('Unconnected Call', 'Recordings cannot be attached to missed or unanswered calls.');
+        return;
+      }
+      const result = await DocumentPicker.getDocumentAsync({
+        type: ['audio/*'],
+        copyToCacheDirectory: true,
+      });
+      if (!result.canceled && result.assets && result.assets[0]) {
+        setManualRecordingFile(result.assets[0]);
+      }
+    } catch (err) {
+      console.log('Failed to pick recording:', err);
+    }
+  };
+
+  const formatDuration = (seconds: number) => {
+    const m = Math.floor(seconds / 60).toString().padStart(2, '0');
+    const s = (seconds % 60).toString().padStart(2, '0');
+    return `${m}:${s}`;
+  };
+
+  // ── Bug 1 Fix: Always render so ringing banner and modal can both appear ──
+
+  return (
+    <>
+      {/* ── Bug 1 Fix: Live Ringing Banner (appears during RINGING state) ── */}
+      {showRingingBanner && (
+        <Animated.View
+          style={[
+            styles.ringingBanner,
+            { transform: [{ translateY: bannerAnim }] }
+          ]}
+        >
+          <View style={styles.ringingBannerLeft}>
+            <View style={styles.ringingIconCircle}>
+              <Ionicons name="call" size={22} color="#fff" />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.ringingLabel}>Incoming Call</Text>
+              {loadingRingingLead ? (
+                <ActivityIndicator size="small" color="#fff" style={{ marginTop: 2 }} />
+              ) : ringingLeadInfo ? (
+                <Text style={styles.ringingName}>
+                  {ringingLeadInfo.first_name} {ringingLeadInfo.last_name}
+                </Text>
+              ) : (
+                <Text style={styles.ringingName}>{ringingPhone || 'Unknown'}</Text>
+              )}
+              <Text style={styles.ringingNumber}>{ringingPhone}</Text>
+              {ringingLeadInfo && (
+                <View style={styles.ringingCrmBadge}>
+                  <Ionicons name="person-circle-outline" size={12} color="#90CDF4" />
+                  <Text style={styles.ringingCrmText}>CRM Match Found</Text>
+                </View>
+              )}
+            </View>
+          </View>
+          <TouchableOpacity
+            style={styles.ringingDismissBtn}
+            onPress={() => {
+              Animated.timing(bannerAnim, {
+                toValue: -120,
+                duration: 250,
+                useNativeDriver: true,
+              }).start(() => setShowRingingBanner(false));
+            }}
+          >
+            <Text style={styles.ringingDismissText}>Dismiss</Text>
+          </TouchableOpacity>
+        </Animated.View>
+      )}
+
+      {/* ── Post-Call Review Modal ── */}
+      <Modal visible={isModalVisible} animationType="slide" transparent={false} presentationStyle="pageSheet">
+        <View style={styles.header}>
+          <Text style={styles.headerText}>Incoming Call Review</Text>
+        </View>
+      
+      <ScrollView style={styles.content}>
+        {loadingLead ? (
+          <Text style={styles.leadMatchText}>Looking up caller in CRM...</Text>
+        ) : leadInfo ? (
+          <View style={styles.leadMatchBox}>
+            <Ionicons name="person" size={16} color="#3182CE" />
+            <Text style={styles.leadMatchText}>Lead Match: <Text style={{fontWeight: 'bold'}}>{leadInfo.first_name} {leadInfo.last_name}</Text></Text>
+          </View>
+        ) : (
+          <View style={[styles.leadMatchBox, { backgroundColor: '#FEF2F2', borderColor: '#FCA5A5' }]}>
+            <Ionicons name="help-circle" size={16} color="#EF4444" />
+            <Text style={[styles.leadMatchText, { color: '#B91C1C' }]}>Unknown Caller: {displayPhone || "Hidden Number"}</Text>
+          </View>
+        )}
+
+        <Text style={styles.durationText}>
+          Duration: <Text style={{ fontWeight: 'bold', color: '#1A202C' }}>{formatDuration(callDuration)}</Text>
+        </Text>
+
+        {leadInfo && (
+          <>
+            <Text style={styles.label}>Update Lead Stage</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.stageScroll}>
+              <View style={styles.stageContainer}>
+                {pipelineStages.map(stage => {
+                  const isSelected = isStageMatching(stage, pipelineStatus);
+                  return (
+                    <TouchableOpacity
+                      key={stage.id}
+                      onPress={() => {
+                        setPipelineStatus(String(stage.id));
+                        setHasExplicitStageChange(true);
+                      }}
+                      style={[styles.stageBadge, isSelected && styles.stageBadgeActive]}
+                    >
+                      <Text style={[styles.stageText, isSelected && styles.stageTextActive]}>
+                        {stage.name}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            </ScrollView>
+
+            <Text style={styles.label}>Call Notes</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="What did they call about?"
+              placeholderTextColor="#A0AEC0"
+              multiline
+              value={postCallNotes}
+              onChangeText={setPostCallNotes}
+            />
+
+            <Text style={styles.label}>Next Follow-up Date</Text>
+            <TouchableOpacity onPress={() => setShowDatePicker(true)} style={styles.datePickerBtn}>
+              <Ionicons name="calendar-outline" size={18} color="#3182CE" />
+              <Text style={{ color: nextFollowupDate ? '#1A202C' : '#A0AEC0', fontSize: 14 }}>
+                {nextFollowupDate ? nextFollowupDate.toLocaleString([], { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Tap to set follow-up'}
+              </Text>
+              {nextFollowupDate && (
+                <TouchableOpacity onPress={() => setNextFollowupDate(null)} style={{ marginLeft: 'auto' }}>
+                  <Ionicons name="close-circle" size={18} color="#EF4444" />
+                </TouchableOpacity>
+              )}
+            </TouchableOpacity>
+
+            {showDatePicker && (
+              <DateTimePicker
+                value={nextFollowupDate || new Date()}
+                mode="datetime"
+                minimumDate={new Date()}
+                onChange={(event, selectedDate) => {
+                  setShowDatePicker(Platform.OS === 'ios');
+                  if (event.type === 'set' && selectedDate) setNextFollowupDate(selectedDate);
+                }}
+              />
+            )}
+          </>
+        )}
+
+        {callStatusState === 'CONNECTED' && (
+          <>
+            <Text style={[styles.label, { marginTop: 20 }]}>Call Recording</Text>
+            {(recordedFilePath || manualRecordingFile) ? (
+              <View style={styles.recordingSuccessBox}>
+                <Ionicons name="checkmark-circle" size={20} color="#38A169" />
+                <Text style={{ color: '#276749', fontSize: 13, flex: 1 }} numberOfLines={1}>
+                  {recordedFilePath ? `Auto-recorded: ${recordedFilePath.split('/').pop()} ✅` : manualRecordingFile?.name}
+                </Text>
+                <TouchableOpacity onPress={() => { setRecordedFilePath(null); setManualRecordingFile(null); }}>
+                  <Ionicons name="trash-outline" size={18} color="#EF4444" />
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <TouchableOpacity onPress={pickRecordingFile} style={styles.uploadBtn}>
+                <Ionicons name="cloud-upload-outline" size={20} color="#3182CE" />
+                <View style={{ flex: 1 }}>
+                  <Text style={{ color: '#3182CE', fontWeight: '700', fontSize: 13 }}>Upload Call Recording</Text>
+                  <Text style={{ color: '#718096', fontSize: 11, marginTop: 2 }}>Audio not found automatically</Text>
+                </View>
+              </TouchableOpacity>
+            )}
+          </>
+        )}
+
+        <TouchableOpacity 
+          style={[styles.saveBtn, isSubmitting && { backgroundColor: '#A0AEC0' }]} 
+          onPress={handleSaveCall}
+          disabled={isSubmitting}
+        >
+          {isSubmitting ? (
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+              <ActivityIndicator color="#FFF" size="small" />
+              <Text style={styles.saveBtnText}>Saving & Uploading...</Text>
+            </View>
+          ) : (
+            <Text style={styles.saveBtnText}>Save & Upload Log</Text>
+          )}
+        </TouchableOpacity>
+
+        <TouchableOpacity style={styles.discardBtn} onPress={resetModal}>
+          <Text style={styles.discardBtnText}>Dismiss</Text>
+        </TouchableOpacity>
+        
+        <View style={{height: 60}} />
+      </ScrollView>
+    </Modal>
+    </>
+  );
+}
+
+const styles = StyleSheet.create({
+  // ── Bug 1: Ringing banner styles ──
+  ringingBanner: {
+    position: 'absolute',
+    top: Platform.OS === 'ios' ? 44 : 0,
+    left: 0,
+    right: 0,
+    zIndex: 9999,
+    backgroundColor: '#1A365D',
+    borderBottomLeftRadius: 16,
+    borderBottomRightRadius: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    paddingTop: Platform.OS === 'ios' ? 16 : 12,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 10,
+  },
+  ringingBannerLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    flex: 1,
+  },
+  ringingIconCircle: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: '#38A169',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  ringingLabel: {
+    color: '#90CDF4',
+    fontSize: 11,
+    fontWeight: '600',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  ringingName: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: 'bold',
+    marginTop: 1,
+  },
+  ringingNumber: {
+    color: '#BEE3F8',
+    fontSize: 12,
+    marginTop: 1,
+  },
+  ringingCrmBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    marginTop: 4,
+  },
+  ringingCrmText: {
+    color: '#90CDF4',
+    fontSize: 11,
+  },
+  ringingDismissBtn: {
+    backgroundColor: 'rgba(255,255,255,0.15)',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 8,
+    marginLeft: 8,
+  },
+  ringingDismissText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  header: {
+    paddingTop: Platform.OS === 'ios' ? 60 : 20,
+    paddingBottom: 20,
+    paddingHorizontal: 20,
+    backgroundColor: '#fff',
+    borderBottomWidth: 1,
+    borderBottomColor: '#E2E8F0',
+  },
+  headerText: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#1A202C',
+  },
+  content: {
+    flex: 1,
+    backgroundColor: '#fff',
+    padding: 20,
+  },
+  leadMatchBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: '#EBF8FF',
+    padding: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#BEE3F8',
+    marginBottom: 16,
+  },
+  leadMatchText: {
+    color: '#2B6CB0',
+    fontSize: 14,
+  },
+  durationText: {
+    fontSize: 16,
+    color: '#718096',
+    marginBottom: 24,
+  },
+  label: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#4A5568',
+    marginBottom: 10,
+  },
+  stageScroll: {
+    marginBottom: 20,
+  },
+  stageContainer: {
+    flexDirection: 'row',
+    gap: 10,
+    paddingVertical: 4,
+  },
+  stageBadge: {
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 20,
+    backgroundColor: '#EBF8FF',
+  },
+  stageBadgeActive: {
+    backgroundColor: '#3182CE',
+  },
+  stageText: {
+    color: '#3182CE',
+    fontWeight: 'bold',
+    fontSize: 12,
+  },
+  stageTextActive: {
+    color: '#FFF',
+  },
+  input: {
+    backgroundColor: '#F7FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    borderRadius: 8,
+    padding: 12,
+    height: 100,
+    textAlignVertical: 'top',
+    color: '#1A202C',
+    marginBottom: 20,
+  },
+  datePickerBtn: {
+    backgroundColor: '#F7FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    borderRadius: 8,
+    padding: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginBottom: 20,
+  },
+  recordingSuccessBox: {
+    backgroundColor: '#F0FFF4',
+    borderWidth: 1,
+    borderColor: '#9AE6B4',
+    borderRadius: 8,
+    padding: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginTop: 8,
+  },
+  uploadBtn: {
+    backgroundColor: '#EBF8FF',
+    borderWidth: 1,
+    borderColor: '#BEE3F8',
+    borderRadius: 8,
+    padding: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginTop: 8,
+  },
+  saveBtn: {
+    backgroundColor: '#10B981',
+    padding: 16,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginTop: 40,
+  },
+  saveBtnText: {
+    color: '#fff',
+    fontWeight: 'bold',
+    fontSize: 16,
+  },
+  discardBtn: {
+    backgroundColor: '#F1F5F9',
+    padding: 16,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginTop: 12,
+  },
+  discardBtnText: {
+    color: '#475569',
+    fontWeight: 'bold',
+    fontSize: 16,
+  },
+});

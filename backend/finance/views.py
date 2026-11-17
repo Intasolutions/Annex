@@ -1,0 +1,61 @@
+from rest_framework import viewsets, permissions, status
+from rest_framework.response import Response
+from rest_framework.decorators import action
+from django.db.models import Sum
+from users.permissions import IsAdminOrSuperAdmin, IsAdminOrReadOnly
+from .models import Expense, ExpenseCategory
+from .serializers import ExpenseSerializer, ExpenseCategorySerializer
+from datetime import datetime, timedelta
+
+class ExpenseCategoryViewSet(viewsets.ModelViewSet):
+    queryset = ExpenseCategory.objects.all()
+    serializer_class = ExpenseCategorySerializer
+    permission_classes = [IsAdminOrReadOnly]
+
+class ExpenseViewSet(viewsets.ModelViewSet):
+    queryset = Expense.objects.all()
+    serializer_class = ExpenseSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_permissions(self):
+        if self.action in ['destroy']:
+            return [IsAdminOrSuperAdmin()]
+        return [permissions.IsAuthenticated()]
+
+    @action(detail=False, methods=['get'])
+    def summary(self, request):
+        import calendar
+        from django.utils import timezone
+
+        # Get total expenses bounded strictly to current month
+        today = timezone.now().date()
+        first_day_of_month = today.replace(day=1)
+        _, last_day_num = calendar.monthrange(today.year, today.month)
+        last_day_of_month = today.replace(day=last_day_num)
+        
+        monthly_total = Expense.objects.filter(
+            date__gte=first_day_of_month,
+            date__lte=last_day_of_month
+        ).aggregate(Sum('amount'))['amount__sum'] or 0
+        all_time_total = Expense.objects.aggregate(Sum('amount'))['amount__sum'] or 0
+        
+        # Get category breakdown bounded strictly to current month
+        categories = ExpenseCategory.objects.all()
+        breakdown = []
+        for cat in categories:
+            total = Expense.objects.filter(
+                category=cat,
+                date__gte=first_day_of_month,
+                date__lte=last_day_of_month
+            ).aggregate(Sum('amount'))['amount__sum'] or 0
+            if total > 0:
+                breakdown.append({
+                    "name": cat.name,
+                    "value": float(total)
+                })
+
+        return Response({
+            "monthly_total": monthly_total,
+            "all_time_total": all_time_total,
+            "breakdown": breakdown
+        })
